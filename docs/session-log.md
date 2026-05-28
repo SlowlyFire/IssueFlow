@@ -76,3 +76,128 @@ src/scheduler/scheduler.module.ts    (new, empty)
 - Stand up `AuditService.record(...)` since many modules will depend on it.
 - Write the `TicketStatusMachine` unit tests **before** writing any
   controller (TDD per CLAUDE.md).
+
+---
+
+## Session 1 — Entities + Ticket state machine (TDD) (2026-05-28)
+
+**Goal:** lock in the persistence layer and the core lifecycle rule as
+pure, tested logic. No controllers, no HTTP, no auth.
+
+### Entities
+All 8 entities created in their respective module folders, registered via
+`TypeOrmModule.forFeature` so `autoLoadEntities: true` picks them up.
+Foreign keys live as plain columns — no `@ManyToOne`/`@OneToMany` yet, since
+nothing queries them through relations. We'll add relation decorators only
+where they justify their weight (likely for `Ticket→Comment` traversal).
+
+- `src/users/user.entity.ts` — id, username (unique idx), email (unique idx),
+  passwordHash, fullName, role enum, createdAt.
+- `src/projects/project.entity.ts` — id, name, description, ownerId,
+  created/updated/deletedAt (soft delete).
+- `src/tickets/ticket.entity.ts` — id, title, description, status enum (default
+  TODO), priority enum (default MEDIUM), type enum, projectId, assigneeId
+  nullable, dueDate nullable, isOverdue (default false), `@VersionColumn`,
+  created/updated/deletedAt. Two composite indexes:
+  `(projectId, status)` for project ticket lists and `(assigneeId, status)`
+  for workload queries.
+- `src/tickets/ticket-dependency.entity.ts` — composite PK (`ticketId`,
+  `blockedById`), plus index on `blockedById` so the reverse lookup is
+  cheap when we need to know what a ticket blocks.
+- `src/comments/comment.entity.ts` — id, ticketId, authorId, content,
+  `@VersionColumn`, created/updatedAt. **No soft delete** on Comment —
+  the README's "Soft Delete APIs" section explicitly limits soft delete to
+  Tickets and Projects, and CLAUDE.md doesn't list Comment under it. So
+  `DELETE /tickets/:id/comments/:cid` will be a hard delete.
+- `src/comments/mention.entity.ts` — id, commentId, mentionedUserId, createdAt.
+  Unique on `(commentId, mentionedUserId)` so the diff-update logic in §3.6
+  cannot create duplicates if the same `@name` appears multiple times in a
+  comment body.
+- `src/attachments/attachment.entity.ts` — id, ticketId, filename, mimeType,
+  sizeBytes (bigint — TypeORM maps to `string` in JS to avoid 2^53 precision
+  loss; we'll parse to number for the 10 MB check), storagePath, uploadedById,
+  createdAt.
+- `src/audit/audit-log.entity.ts` — id, actorType enum (USER|SYSTEM),
+  actorId nullable, action (varchar), entityType (varchar), entityId,
+  beforeJson + afterJson as `jsonb`, createdAt. Indexes on
+  `(entityType, entityId)`, `(action)`, and `(actorType, actorId)` to make
+  the `GET /audit-logs` query filters fast.
+
+`ActorType` enum (USER, SYSTEM) added to `src/common/enums.ts`.
+
+### Table verification
+After `npm run start:dev`, `docker compose exec db psql -U issueflow -d
+issueflow -c '\dt'` showed all 8 tables: `attachments`, `audit_logs`,
+`comments`, `mentions`, `projects`, `ticket_dependencies`, `tickets`,
+`users`. Spot-checked `\d tickets` — status/priority/type postgres enums,
+`isOverdue boolean default false`, `version`, `deletedAt` nullable, both
+composite indexes present.
+
+### Ticket state machine (TDD)
+- `src/tickets/ticket-state-machine.ts` — pure function, no DB, no DI:
+  ```ts
+  assertTransitionAllowed(
+    current: TicketStatus,
+    target: TicketStatus,
+    opts: { blockersAllDone: boolean },
+  ): void
+  ```
+  Throws `InvalidTicketTransitionError` (a named subclass of `Error`) so the
+  controller layer can map it cleanly to 400 — the rejection message names
+  the broken rule, which we'll surface directly in the HTTP response.
+
+- TDD flow: wrote `ticket-state-machine.spec.ts` first (24 cases), ran it,
+  saw `TS2307: Cannot find module './ticket-state-machine'` (RED).
+  Implemented, hit 23/24, fixed an ordering bug (see below), got 24/24
+  green. Full suite: 25/25.
+
+### Design decisions worth flagging
+- **Reject skip-transitions.** `TODO → IN_REVIEW` / `TODO → DONE` /
+  `IN_PROGRESS → DONE` all rejected. CLAUDE.md says "Allowed forward path
+  ONLY: TODO → IN_PROGRESS → IN_REVIEW → DONE" — the stages exist precisely
+  so review happens before done; allowing a skip would render `IN_REVIEW`
+  meaningless. Rejection message says "skip lifecycle stages (sequential
+  only)".
+- **Reject same-status transitions.** `TODO → TODO` etc. rejected as no-ops.
+  A real status change is always meaningful work, so silently accepting a
+  no-op would mask bugs in callers (e.g. a UI that resends the same status
+  by accident). Cheap defensive check.
+- **Same-status beats DONE-terminal for `DONE → DONE`.** When current and
+  target both equal DONE, both rules technically apply. The implementation
+  checks same-status first because it's the more specific description of
+  what the caller asked for ("no change") versus what they didn't do
+  ("leave DONE"). This came out of a failing test on the first
+  implementation pass — fixing the ordering, not the rule, made it green.
+- **Blocker gate only fires on transitions INTO DONE.** Specifically the
+  blockers check sits *after* the legal-transition check, so a transition
+  like `TODO → IN_PROGRESS` with `blockersAllDone: false` succeeds (we don't
+  care about blockers for non-DONE targets). A unit test pins this down.
+
+### Files touched
+```
+src/common/enums.ts                          (added ActorType)
+src/users/user.entity.ts                     (new)
+src/users/users.module.ts                    (forFeature([User]))
+src/projects/project.entity.ts               (new)
+src/projects/projects.module.ts              (forFeature([Project]))
+src/tickets/ticket.entity.ts                 (new)
+src/tickets/ticket-dependency.entity.ts      (new)
+src/tickets/tickets.module.ts                (forFeature([Ticket, TicketDependency]))
+src/tickets/ticket-state-machine.ts          (new)
+src/tickets/ticket-state-machine.spec.ts     (new, 24 cases)
+src/comments/comment.entity.ts               (new)
+src/comments/mention.entity.ts               (new)
+src/comments/comments.module.ts              (forFeature([Comment, Mention]))
+src/attachments/attachment.entity.ts         (new)
+src/attachments/attachments.module.ts        (forFeature([Attachment]))
+src/audit/audit-log.entity.ts                (new)
+src/audit/audit.module.ts                    (forFeature([AuditLog]))
+```
+
+### Next session
+- Wire `AuthModule` first (JWT login/logout/me, `JwtStrategy`, `JwtAuthGuard`,
+  `RolesGuard`, token deny-list). Everything downstream needs `@CurrentUser`.
+- Then `UsersService` + controller — small, mostly CRUD, useful smoke test
+  for the validation pipe and exception filter.
+- Stand up `AuditService.record(...)` alongside Users so it's available when
+  Projects/Tickets land in the session after.
