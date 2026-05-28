@@ -201,3 +201,128 @@ src/audit/audit.module.ts                    (forFeature([AuditLog]))
   for the validation pipe and exception filter.
 - Stand up `AuditService.record(...)` alongside Users so it's available when
   Projects/Tickets land in the session after.
+
+---
+
+## Session 2 — Auth + Users (2026-05-28)
+
+**Goal:** end-to-end JWT auth plus full Users CRUD. Everything authenticated
+by default; `@Public()` is the opt-out.
+
+### Users module
+- `UsersService` — bcrypt (rounds = 10) on `create`; `assertUnique` does a
+  single OR-query against `(username | email)` and reports which one
+  collided with a 409. `findByUsername` is **password-aware** (returns the
+  full entity including `passwordHash`) and is the only path AuthService
+  uses to verify credentials — every other read goes through `findOne`,
+  which serializes through `ClassSerializerInterceptor` and strips
+  `passwordHash` via the `@Exclude` decorator on the entity field.
+- `UsersController` matches the README contract exactly: `POST /users`,
+  `GET /users`, `GET /users/:userId`, `POST /users/update/:userId`,
+  `DELETE /users/:userId`. Every non-GET route is annotated `@HttpCode(200)`
+  per CLAUDE.md ("All success responses are 200 OK"). Update accepts only
+  `fullName` and `role`, per the contract.
+- DTOs use class-validator: `@IsEmail`, `@IsEnum(UserRole)`, username
+  regex `[a-zA-Z0-9_.-]+` of length 3–64, password ≥ 8 chars. Anything else
+  in the body is bounced by the global `forbidNonWhitelisted` —
+  verified live with `{"isAdmin": true}` → 400.
+
+### Auth module
+- `POST /auth/login` — generic 401 ("Invalid credentials") on both wrong
+  password AND missing user. We also run `bcrypt.compare` against a fake
+  hash when the user is missing so response timing doesn't disclose
+  whether the username exists. Pinned by an e2e test that asserts the two
+  401 bodies are byte-identical.
+- JWT payload: `{ sub: userId, username, role, jti }`. `jti` is a `randomUUID`
+  generated at sign time — it's the key the deny-list keys on.
+- `POST /auth/logout` — adds the request's `jti` to `TokenDenyListService`.
+- `GET /auth/me` — reads `req.user` (populated by `JwtStrategy.validate`) via
+  a `@CurrentUser()` param decorator and re-fetches the full profile from
+  the DB. (We could return the JWT payload directly, but reading from the
+  DB means a role change is reflected immediately on the user's next
+  /auth/me without needing to invalidate the token.)
+
+### Guard wiring (this is the most important design choice in this session)
+- `JwtAuthGuard` is registered **globally** via `APP_GUARD` in `AppModule`.
+  So **every** route is locked down by default. To open a route, slap
+  `@Public()` on it. The two places this matters today are `POST /users`
+  (registration) and `POST /auth/login`. The existing `GET /` health route
+  also gets `@Public`.
+- `JwtAuthGuard` first reads `IS_PUBLIC_KEY` via `Reflector.getAllAndOverride`
+  (handler-then-class); if public, short-circuits to `true` and skips
+  passport entirely. Otherwise it calls `super.canActivate` which runs
+  passport-jwt, which calls `JwtStrategy.validate`, which **also** checks
+  the deny-list. So a revoked token fails in `validate`, not in the guard
+  itself — keeping the deny-list logic next to the rest of the auth-claim
+  logic.
+- `RolesGuard` is built and exported but **not** wired globally yet. Once
+  the admin-only routes land (e.g. `GET /projects/deleted`) we'll add
+  `@UseGuards(JwtAuthGuard, RolesGuard)` + `@Roles(UserRole.ADMIN)`
+  per-route. Building it now means those endpoints become a one-line
+  retrofit.
+
+### Deny-list design
+- `TokenDenyListService` is a simple `Set<string>` of `jti`s.
+- In-memory, process-local — **resets on restart**. Documented inline in
+  the service file. Acceptable for this assignment because:
+  1. There's a single process behind the API.
+  2. After a restart, the only tokens that survive are ones whose owners
+     never logged out (i.e. equivalent to never having logged out yet).
+  3. Tokens expire on their own after `JWT_EXPIRES_IN` (3600s by default),
+     so the deny-list never has to remember anything past one hour.
+- A production deployment would back this with Redis keyed by `jti` with
+  `EXPIRE` set to the token's `exp - now`, so each entry frees itself.
+
+### passwordHash never leaks
+- `@Exclude()` on `User.passwordHash` + `ClassSerializerInterceptor`
+  globally via `APP_INTERCEPTOR`. The e2e test asserts
+  `expect(body).not.toHaveProperty('passwordHash')` on both the registration
+  response and `/auth/me`.
+
+### Tests
+- Unit: 33/33 (incl. 4 deny-list cases, 4 bcrypt cases, the existing 24
+  state-machine cases, and the Nest scaffold spec).
+- e2e: 5/5 across `app.e2e-spec.ts` and a new `auth.e2e-spec.ts`. The auth
+  e2e truncates the `users` table in `beforeAll` so the run is
+  deterministic even when re-run on the same dev DB.
+- Manual smoke (curl): register → login → /auth/me (200, no passwordHash) →
+  no-token (401) → logout (200) → reused-token (401 "revoked") →
+  duplicate-registration (409). All confirmed against a live dev server.
+
+### Files touched
+```
+src/app.module.ts                                   (global guard + interceptor)
+src/app.controller.ts                               (@Public on /)
+src/users/user.entity.ts                            (@Exclude on passwordHash)
+src/users/dto/create-user.dto.ts                    (new)
+src/users/dto/update-user.dto.ts                    (new)
+src/users/users.service.ts                          (new — bcrypt, unique, CRUD)
+src/users/users.controller.ts                       (new — README endpoints)
+src/users/users.module.ts                           (controller + service)
+src/auth/dto/login.dto.ts                           (new)
+src/auth/auth.service.ts                            (new — login + logout)
+src/auth/auth.controller.ts                         (new — login/logout/me)
+src/auth/auth.module.ts                             (JwtModule wiring)
+src/auth/jwt.strategy.ts                            (new — checks deny-list)
+src/auth/jwt-auth.guard.ts                          (new — respects @Public)
+src/auth/roles.guard.ts                             (new — not yet applied)
+src/auth/token-deny-list.service.ts                 (new — in-memory)
+src/auth/token-deny-list.service.spec.ts            (new, 4 cases)
+src/auth/password.spec.ts                           (new, 4 cases)
+src/common/decorators/public.decorator.ts           (new)
+src/common/decorators/roles.decorator.ts            (new)
+src/common/decorators/current-user.decorator.ts     (new)
+test/app.e2e-spec.ts                                (mirrors main.ts globals)
+test/auth.e2e-spec.ts                               (new, 4 cases)
+```
+
+### Next session
+- `AuditService.record(...)` — needs to exist before Projects/Tickets so
+  the state-changing endpoints can audit cleanly. Tiny module: one method,
+  one repo, no controller yet (we'll add `GET /audit-logs` in the same
+  session as Projects).
+- Projects CRUD + soft-delete + `GET /projects/:id/workload`. Soft delete is
+  the first place we need `@Roles(UserRole.ADMIN)` — wire RolesGuard then.
+- Once Projects exists, start Tickets: the state machine moves from
+  pure-function to plumbed-into-the-service, plus dependencies and CSV
+  export/import.

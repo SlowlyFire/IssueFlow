@@ -1,19 +1,21 @@
-import { Module } from '@nestjs/common';
+import { ClassSerializerInterceptor, Module } from '@nestjs/common';
 import { ConfigModule, ConfigService } from '@nestjs/config';
-import { TypeOrmModule } from '@nestjs/typeorm';
+import { APP_GUARD, APP_INTERCEPTOR } from '@nestjs/core';
 import { ScheduleModule } from '@nestjs/schedule';
+import { TypeOrmModule } from '@nestjs/typeorm';
 
 import { AppController } from './app.controller';
 import { AppService } from './app.service';
 
-import { AuthModule } from './auth/auth.module';
-import { UsersModule } from './users/users.module';
-import { ProjectsModule } from './projects/projects.module';
-import { TicketsModule } from './tickets/tickets.module';
-import { CommentsModule } from './comments/comments.module';
 import { AttachmentsModule } from './attachments/attachments.module';
 import { AuditModule } from './audit/audit.module';
+import { AuthModule } from './auth/auth.module';
+import { JwtAuthGuard } from './auth/jwt-auth.guard';
+import { CommentsModule } from './comments/comments.module';
+import { ProjectsModule } from './projects/projects.module';
 import { SchedulerModule } from './scheduler/scheduler.module';
+import { TicketsModule } from './tickets/tickets.module';
+import { UsersModule } from './users/users.module';
 
 @Module({
   imports: [
@@ -43,6 +45,16 @@ import { SchedulerModule } from './scheduler/scheduler.module';
     SchedulerModule,
   ],
   controllers: [AppController],
-  providers: [AppService],
+  providers: [
+    AppService,
+    // Authenticate every route by default. Anything that needs to be open
+    // must mark itself with @Public() (e.g. POST /users registration,
+    // POST /auth/login).
+    { provide: APP_GUARD, useClass: JwtAuthGuard },
+    // Applies class-transformer @Exclude/@Expose to every response. The
+    // User entity marks passwordHash @Exclude — this is what guarantees no
+    // controller can leak it.
+    { provide: APP_INTERCEPTOR, useClass: ClassSerializerInterceptor },
+  ],
 })
 export class AppModule {}
