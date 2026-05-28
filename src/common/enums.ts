@@ -22,3 +22,8 @@ export enum UserRole {
   ADMIN = 'ADMIN',
   DEVELOPER = 'DEVELOPER',
 }
+
+export enum ActorType {
+  USER = 'USER',
+  SYSTEM = 'SYSTEM',
+}
