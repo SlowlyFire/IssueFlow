@@ -419,3 +419,151 @@ test/projects.e2e-spec.ts               (new — 12 cases)
 - Tickets CRUD + state machine plumbed into service + dependencies +
   soft-delete (mirrors the projects pattern) + CSV export/import.
 - Comments + Mentions; auto-assignment on ticket create; escalation scheduler.
+
+---
+
+## Session 4 — Tickets core: CRUD + state machine wiring + If-Match locking + soft-delete (2026-05-28)
+
+**Goal:** lock in the editable lifecycle of a Ticket. No dependencies / CSV /
+auto-assign / escalation yet — those are later sessions. Stayed scoped.
+
+### Endpoints (all 200, matching README)
+- `POST /tickets` — validates `projectId` exists (404 if not), `assigneeId`
+  exists if given (404 if not), all enums (400 if not). Defaults `status` to
+  TODO; rejects `status: DONE` on create with a 400 ("ticket cannot be
+  created directly in DONE"). Response includes `version` and an
+  `ETag: "<version>"` header.
+- `GET /tickets?projectId=:projectId` — query param (per README), validates
+  project exists.
+- `GET /tickets/deleted?projectId=:projectId` — **ADMIN-only**. Declared
+  before `:ticketId` so "deleted" isn't matched as an integer id.
+- `GET /tickets/:ticketId` — sets `ETag` header.
+- `PATCH /tickets/:ticketId` — the complex one (see below).
+- `DELETE /tickets/:ticketId` — soft delete via `softRemove`.
+- `POST /tickets/:ticketId/restore` — **ADMIN-only**. 404 if not actually
+  soft-deleted.
+
+### How the state machine is wired into PATCH
+The pure-function `assertTransitionAllowed` from Session 1 is called from
+`TicketsService.update` only when `dto.status` is supplied AND differs from
+the current status. On `InvalidTicketTransitionError` we catch and rethrow as
+`BadRequestException(message)` — the rule-naming message becomes the 400 body.
+`blockersAllDone: true` is hard-coded for now; there's a `TODO(session-5)`
+right next to it to swap in the real blocker computation once dependencies
+exist.
+
+### Why DONE-frozen is a separate check (and runs first)
+The state machine alone would already reject `DONE → anything` as a backward
+or same-status transition. **But CLAUDE.md says DONE freezes *every field*,
+not just status.** A `PATCH /tickets/:id { title: "..." }` on a DONE ticket
+must also be rejected — even though no status transition is happening, and
+even though the state machine would happily pass a no-status update through.
+
+So `if (ticket.status === DONE) throw 409` lives in `update()` itself, ahead
+of the state-machine call. It also runs **before** the If-Match check. A
+frozen resource should report its frozen-ness, not lie about a missing or
+stale version header — `PATCH /tickets/:done-id` with no `If-Match` returns
+**409**, not 428. Pinned by an e2e case ("DONE-frozen wins over missing
+If-Match").
+
+### The full If-Match / ETag contract (for run.md)
+- Every ticket response carries `version` in the body AND sets an
+  `ETag: "<version>"` header. POST, GET, PATCH responses all do this so the
+  client always has a fresh value to send back.
+- `PATCH /tickets/:id` **requires** an `If-Match` header carrying the
+  version the client based its edit on (e.g. `If-Match: "3"`). The parse is
+  tolerant: `"3"`, `3`, and `W/"3"` are all accepted.
+- **Missing** `If-Match` → **428 Precondition Required** with a message
+  reminding the caller to carry the version. We refuse to silently accept
+  unversioned writes — that would defeat the lock.
+- **Stale** `If-Match` (the supplied version doesn't match the row's
+  current version) → **412 Precondition Failed** with a message naming
+  current and supplied versions.
+- **On success**, the response body includes the new (incremented)
+  `version` and the `ETag` header points to it.
+- The DONE-frozen 409 fires **before** all of the above for terminal tickets.
+
+### Defense-in-depth on the version (and one TypeORM gotcha worth a paragraph)
+The user spec asked for two layers — explicit check + TypeORM
+`@VersionColumn` catching `OptimisticLockVersionMismatchError` on save. The
+first layer works as designed. **But:** TypeORM 0.3.x's
+`repository.save(entity)` with `@VersionColumn` auto-increments the version
+column in the UPDATE's SET clause but does **not** include the original
+version in the WHERE clause — so it would silently overwrite a concurrent
+writer, never throwing `OptimisticLockVersionMismatchError`. A direct unit
+test in the first pass of this session confirmed that: side-channel-bump
+the row from version 1 to 2, then `repo.save(stale)` and watch it resolve
+quietly.
+
+So the second line of defense is implemented as an **atomic conditional
+UPDATE**:
+```sql
+UPDATE tickets SET ..., version = version + 1, updatedAt = now()
+WHERE id = $1 AND version = $expected
+```
+If `result.affected === 0`, the explicit check passed for *both* concurrent
+requests but Postgres's row-level lock serialized them — one's UPDATE found
+version=N, the other found N+1 and matched zero rows. We map that to 412 with
+the message *"Ticket was modified concurrently (race detected at write);
+reload and retry"*. The atomic UPDATE replaces `save()` for the version-bump
+path; we still use `save()` for `create()` where there's no version concern.
+
+### How we proved the race-defense works
+Two e2e cases:
+1. **Concurrent HTTP race** (`Promise.allSettled` of two PATCH requests, both
+   with `If-Match: "1"`). Asserts exactly one 200 and exactly one 412. Under
+   Node's event loop the two findOnes typically run before either UPDATE, so
+   both pass the explicit check; the atomic UPDATE then catches the loser at
+   the DB.
+2. **Deterministic side-channel** — load via repo, bump via the public PATCH,
+   then run the same atomic conditional UPDATE the service uses with the
+   stale version. Asserts `result.affected === 0` and the row's title is
+   unchanged. No flake risk, exercises only the second-line-of-defense path.
+
+### Tests
+- Unit: 33/33 (unchanged — state machine still has its 24 pure cases).
+- e2e: 42/42 total (25 new tickets cases + 17 prior). The 25 new ones cover:
+  - **Create:** defaults TODO/v=1/ETag, reject status=DONE, 404 on bad
+    projectId, 404 on bad assigneeId.
+  - **State machine via PATCH:** skip rejected, backward rejected, full
+    forward lifecycle with version bumps, DONE-frozen 409, DONE-frozen wins
+    over missing If-Match.
+  - **If-Match contract:** 428 missing, 412 stale, 200 correct + version
+    increments + ETag, tolerant parse (quoted/unquoted), concurrent race
+    412, deterministic atomic-UPDATE-rejects-stale.
+  - **Validation:** unknown body fields (forbidNonWhitelisted), bad
+    If-Match format (400).
+  - **Soft-delete + admin:** DELETE soft-deletes, GET list/by-id hide it,
+    ADMIN sees in /tickets/deleted, DEVELOPER → 403, ADMIN restores → back
+    in list, DEVELOPER restore → 403, restore-not-deleted → 404.
+
+### Files touched
+```
+src/tickets/dto/create-ticket.dto.ts     (new — reject status=DONE on create)
+src/tickets/dto/update-ticket.dto.ts     (new — README fields only)
+src/tickets/dto/list-tickets.dto.ts      (new — query ?projectId)
+src/tickets/tickets.service.ts           (new — CRUD + SM + atomic UPDATE)
+src/tickets/tickets.controller.ts        (new — routes + If-Match + ETag)
+src/tickets/tickets.module.ts            (wire deps: Projects, Users, Auth)
+test/tickets.e2e-spec.ts                 (new — 25 cases)
+```
+
+### Pending for run.md (when we write it)
+- The full If-Match / ETag / 428 / 412 contract above belongs in run.md so
+  reviewers know how to drive PATCH from curl/Postman without reading the
+  service source.
+- The session-0 password decision (`POST /users` accepts `password`) also
+  belongs there.
+
+### Next session
+- `AuditService.record(...)` — inject into Projects and Tickets state-changing
+  paths. Audit entries persisted; `GET /audit-logs` endpoint with the four
+  query filters.
+- `GET /projects/:id/workload`.
+- Ticket **dependencies**: `POST /tickets/:id/dependencies`,
+  `GET /tickets/:id/dependencies`,
+  `DELETE /tickets/:id/dependencies/:blockerId`. Then replace the hard-coded
+  `blockersAllDone: true` with real computation.
+- Comments + mentions, with the mention-diff logic.
+- Auto-assignment on ticket create; escalation scheduler.
+- CSV import/export.
