@@ -6,6 +6,7 @@ import { UsersModule } from '../users/users.module';
 import { AuthController } from './auth.controller';
 import { AuthService } from './auth.service';
 import { JwtStrategy } from './jwt.strategy';
+import { RolesGuard } from './roles.guard';
 import { TokenDenyListService } from './token-deny-list.service';
 
 @Module({
@@ -24,7 +25,7 @@ import { TokenDenyListService } from './token-deny-list.service';
     }),
   ],
   controllers: [AuthController],
-  providers: [AuthService, JwtStrategy, TokenDenyListService],
-  exports: [TokenDenyListService],
+  providers: [AuthService, JwtStrategy, TokenDenyListService, RolesGuard],
+  exports: [TokenDenyListService, RolesGuard],
 })
 export class AuthModule {}

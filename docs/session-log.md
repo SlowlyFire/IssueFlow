@@ -326,3 +326,96 @@ test/auth.e2e-spec.ts                               (new, 4 cases)
 - Once Projects exists, start Tickets: the state machine moves from
   pure-function to plumbed-into-the-service, plus dependencies and CSV
   export/import.
+
+---
+
+## Session 3 — Projects CRUD + soft-delete + admin endpoints (2026-05-28)
+
+**Goal:** full Projects CRUD with the soft-delete pattern established cleanly
+so the Tickets session can mirror it. First live use of RolesGuard.
+
+### How TypeORM hides soft-deleted rows automatically
+
+TypeORM tracks a `@DeleteDateColumn` field (`deletedAt`). When any query runs
+through a Repository (`.find`, `.findOne`, `createQueryBuilder`) TypeORM
+automatically appends `WHERE "deletedAt" IS NULL` — no manual filtering needed.
+The two places where we intentionally bypass this behaviour:
+- `listDeleted()` — `find({ withDeleted: true, where: { deletedAt: Not(IsNull()) } })`:
+  `withDeleted: true` lifts the automatic filter; then `Not(IsNull())` keeps only
+  the actually-deleted rows (without the filter, active rows would also show).
+- `restore()` — first a `findOne({ withDeleted: true, where: { id, deletedAt: Not(IsNull()) } })`
+  to confirm the project exists AND is soft-deleted (returns 404 otherwise, not a
+  silent no-op), then `repository.restore(id)` which sets `deletedAt = NULL`.
+
+`softRemove(entity)` was used for the delete path (rather than `softDelete(id)`)
+because `softRemove` triggers TypeORM lifecycle hooks and cascades — consistent
+with how we'll do ticket soft-delete.
+
+### Soft-delete pattern comment
+A single block comment at the top of `projects.service.ts` describes the
+three-operation pattern (standard read / list-deleted / restore) so the
+tickets service session can mirror it without re-deriving.
+
+### How RolesGuard enforces ADMIN
+
+`RolesGuard` is applied **per-route** with `@UseGuards(JwtAuthGuard, RolesGuard)`.
+It reads `@Roles(UserRole.ADMIN)` via `Reflector.getAllAndOverride`. If the
+current user's `role` (from the JWT payload, set by `JwtStrategy.validate`)
+is not in the required list, it throws `ForbiddenException` ("Requires role(s):
+ADMIN") → 403.
+
+Why per-route rather than global? The vast majority of endpoints don't need a
+role restriction — they just need to be authenticated. Adding `RolesGuard`
+globally would be no-op on every unannotated route, but it would also fire on
+every request, adding one more reflection lookup to the hot path for no benefit.
+Per-route is also more legible: the decorator sits right next to the handler,
+making the access policy visible at a glance.
+
+`RolesGuard` is now exported from `AuthModule` so any feature module that
+imports `AuthModule` can use it in `@UseGuards` without registering it again.
+
+### Route order matters for `/projects/deleted`
+
+`/projects/deleted` is declared **before** `/:projectId` in the controller.
+Nest/Express register routes in declaration order — if `/:projectId` came first,
+the string "deleted" would be matched as an integer param, `ParseIntPipe` would
+throw 400 on `NaN`, and the admin endpoint would never be reachable. The same
+ordering rule applies to `/tickets/export`, `/tickets/deleted` etc. in the next
+session.
+
+### ownerId validation
+
+`POST /projects` calls `UsersService.findOne(dto.ownerId)` before saving. If the
+user doesn't exist it throws `NotFoundException` → 404. This is the only FK we
+validate in the service layer (the DB has no FK constraints since we're using
+plain columns). Validated by an e2e test case.
+
+### Tests
+- e2e: 17/17 total (12 new projects cases + 5 carried over).
+- Unit: 33/33 (unchanged).
+- The 12 projects cases cover the full lifecycle in order:
+  create, bad ownerId (404), soft-delete, gone-from-list, 404-by-id,
+  visible-in-/deleted (ADMIN), 403-on-/deleted (DEVELOPER), restore,
+  back-in-list, 403-on-restore (DEVELOPER), 401-on-restore (no token),
+  PATCH update.
+
+### Files touched
+```
+src/auth/auth.module.ts                  (export RolesGuard)
+src/projects/dto/create-project.dto.ts   (new)
+src/projects/dto/update-project.dto.ts   (new)
+src/projects/projects.service.ts         (new — CRUD + soft-delete + admin)
+src/projects/projects.controller.ts      (new — all README routes + admin)
+src/projects/projects.module.ts          (controller + service + AuthModule import)
+test/projects.e2e-spec.ts               (new — 12 cases)
+```
+
+### Next session
+- `AuditService.record(...)` — inject into Projects and Tickets. Small module,
+  one method, no HTTP controller yet; `GET /audit-logs` endpoint can land in
+  the same session or a dedicated pass.
+- `GET /projects/:id/workload` — joins User + Ticket, counts non-DONE tickets
+  per developer in the project; depends on Ticket entity existing (it does).
+- Tickets CRUD + state machine plumbed into service + dependencies +
+  soft-delete (mirrors the projects pattern) + CSV export/import.
+- Comments + Mentions; auto-assignment on ticket create; escalation scheduler.
