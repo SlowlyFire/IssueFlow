@@ -19,10 +19,14 @@ import { CreateProjectDto } from './dto/create-project.dto';
 import { UpdateProjectDto } from './dto/update-project.dto';
 import { Project } from './project.entity';
 import { ProjectsService } from './projects.service';
+import { WorkloadEntry, WorkloadService } from './workload.service';
 
 @Controller('projects')
 export class ProjectsController {
-  constructor(private readonly projects: ProjectsService) {}
+  constructor(
+    private readonly projects: ProjectsService,
+    private readonly workload: WorkloadService,
+  ) {}
 
   @Post()
   @HttpCode(HttpStatus.OK)
@@ -43,6 +47,13 @@ export class ProjectsController {
   @Roles(UserRole.ADMIN)
   listDeleted(): Promise<Project[]> {
     return this.projects.listDeleted();
+  }
+
+  @Get(':projectId/workload')
+  getWorkload(
+    @Param('projectId', ParseIntPipe) id: number,
+  ): Promise<WorkloadEntry[]> {
+    return this.workload.getWorkloadForProject(id);
   }
 
   @Get(':projectId')

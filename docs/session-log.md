@@ -567,3 +567,149 @@ test/tickets.e2e-spec.ts                 (new — 25 cases)
 - Comments + mentions, with the mention-diff logic.
 - Auto-assignment on ticket create; escalation scheduler.
 - CSV import/export.
+
+---
+
+## Session 5 — Dependencies, real DONE-blocker rule, auto-assignment, workload, minimal AuditService (2026-05-29)
+
+**Goal:** wire the rest of the ticket lifecycle pieces that depend on data
+already in place. No CSV / escalation / attachments / mentions / audit
+endpoint yet — kept scope tight.
+
+### Endpoints added
+- `POST /tickets/:ticketId/dependencies` — body `{ blockedBy }`, 200 OK.
+- `GET /tickets/:ticketId/dependencies` — list of blocker tickets (soft-deleted
+  blockers are silently filtered out).
+- `DELETE /tickets/:ticketId/dependencies/:blockerId` — 200; 404 if the row
+  doesn't exist.
+- `GET /projects/:projectId/workload` — `[ { userId, username, openTicketCount } ]`
+  sorted ascending by count, then by registration order.
+
+### Cycle detection
+`TicketDependenciesService.wouldCreateCycle(targetTicketId, newBlockerId)`
+runs BFS from `newBlockerId` along existing `blockedBy` edges. If
+`targetTicketId` is reachable, the new edge would close a cycle
+`target → newBlocker → … → target` — reject 400. The traversal uses a
+`visited` set so any pre-existing cycle (shouldn't happen, but defensive)
+doesn't loop forever. Per-step DB queries; the dependency graph is
+tiny in practice. Three test cases lock this down: self-dep (immediate
+reject), 2-node `A↔B`, 3-node `A→B→C→A` (proves BFS handles depth).
+
+Cross-project rejection happens *before* the cycle check; we don't bother
+traversing a graph whose end-points couldn't validly be connected anyway.
+
+### Real DONE-blocker rule (replacing Session 4's `blockersAllDone: true`)
+In `TicketsService.update`, when the target status is DONE, we compute
+`openBlockerIds` from `TicketDependenciesService.openBlockerIds(ticketId)`
+(blockers whose status is not DONE; soft-deleted blockers are filtered out
+by the default scope). The boolean `blockersAllDone = openBlockerIds.length === 0`
+goes to the state machine — so the pure function still encodes the rule and
+is the source of truth. The state machine's rejection is caught, and when
+the cause was blockers we throw a richer 400:
+
+```
+Cannot transition to DONE: blocked by tickets [42, 57]
+```
+
+The state machine's own generic message is preserved for any *other* kind
+of rejection that bubbles through that catch.
+
+### Auto-assignment
+On `POST /tickets`, if `dto.assigneeId` is undefined, we call
+`WorkloadService.pickAutoAssignee(projectId)` — same query as the public
+workload endpoint, returning the first entry's `userId` (or `null` if no
+DEVELOPERs exist). When assigneeId comes from the request, we honor it
+(after validating the user exists). Auto-assign **never** runs on update;
+that path already accepts `assigneeId` from the client unchanged.
+
+**Tie-breaker logic** (CLAUDE.md §3.8): the workload SQL orders by
+`COUNT(t.id) ASC, u.createdAt ASC, u.id ASC`. So among devs with the
+lowest open count, the earliest registered wins; if `createdAt` is
+identical (which it won't be in practice — Postgres timestamps are
+microsecond-granular), `id ASC` breaks the final tie deterministically.
+
+### Why WorkloadService lives in `projects/` (not `tickets/`)
+The endpoint URL is `/projects/:id/workload`, so the route belongs in
+`ProjectsController`. But the query needs Ticket + User repos. Putting
+the service in `TicketsModule` would force a Tickets ↔ Projects circular
+import (TicketsModule already imports ProjectsModule for project lookups).
+Putting it in `ProjectsModule` and registering Ticket + User entities for
+its `forFeature` keeps the dependency direction clean: ProjectsModule has
+no service-level dependency on TicketsModule, just direct entity access.
+ProjectsModule exports `WorkloadService` so `TicketsService.create` can
+inject it for auto-assign.
+
+### Assumption documented in code (`workload.service.ts`)
+The README has no project-membership concept (projects have an `ownerId`,
+nothing else). So "the DEVELOPERs in the project" effectively means "all
+DEVELOPERs in the system" — a developer with zero tickets in this project
+is the strongest auto-assign candidate and is included in the workload
+response with `openTicketCount: 0`.
+
+### Minimal AuditService scope
+Only `AUTO_ASSIGN` (with `actorType: SYSTEM`) is recorded this session;
+all the other state-changing paths will be retrofitted in Session 6 when
+the `GET /audit-logs` endpoint also lands. Keeping this session tight on
+purpose. The audit row is asserted directly from the DB in an e2e case to
+verify the shape (`actorType: 'SYSTEM'`, `actorId: null`, `action:
+'AUTO_ASSIGN'`, `entityType: 'Ticket'`, `entityId`, `afterJson:
+{ assigneeId }`).
+
+If `pickAutoAssignee` returns `null` (no DEVELOPERs at all), the ticket
+saves with `assigneeId: null` and **no audit row is written** — the audit
+is for "I assigned X to Y", not "I tried and failed". Pinned by an e2e
+case.
+
+### Test infrastructure fix: serial e2e
+Adding the dependencies suite revealed Jest's default parallel-worker
+strategy was interleaving e2e suites that share the same Postgres DB —
+TRUNCATEs in one beforeAll were wiping the other's setup mid-run. Two
+test files passed in isolation, both failed when run together. Fixed by
+adding `"maxWorkers": 1` to `test/jest-e2e.json`. The e2e config is
+inherently serial because of the shared DB; setting this explicitly
+removes the latent flake. With this in place: 5 suites, 68 cases, all
+green when run together.
+
+### Tests
+- Unit: 33/33 (unchanged).
+- e2e: 68/68 across 5 suites (26 new in `dependencies-and-autoassign.e2e-spec.ts`):
+  - Auto-assign: ADMIN never chosen; [0,0] tie → A; [1,0] → B; [1,1] tie → A
+    again; explicit honored; bad explicit → 404; audit row shape verified;
+    no DEVELOPERs → null + no audit.
+  - Workload: ascending counts; includes zeros; excludes ADMINs; DONE
+    doesn't count; works for DEVELOPER token; 401 no token; 404 unknown
+    project.
+  - Dependencies: add + list; self → 400; cross-project → 400; 2-node
+    cycle → 400; 3-node cycle → 400; delete + 404-on-second-delete;
+    soft-deleted blocker hidden from list; soft-deleted ticket cannot be
+    added as a blocker → 404; idempotent re-add.
+  - DONE-blocker rule: 400 names blocker id; resolve blocker → DONE
+    succeeds; no blockers → freely DONE; multiple open → message lists
+    all ids.
+
+### Files touched
+```
+src/audit/audit.service.ts                       (new — record() only)
+src/audit/audit.module.ts                        (exports AuditService)
+src/projects/workload.service.ts                 (new — query + autoassign pick)
+src/projects/projects.module.ts                  (registers Ticket+User entities; exports WorkloadService)
+src/projects/projects.controller.ts              (GET :projectId/workload)
+src/tickets/ticket-dependencies.service.ts       (new — CRUD + cycle BFS + openBlockerIds)
+src/tickets/ticket-dependencies.controller.ts    (new — POST/GET/DELETE)
+src/tickets/tickets.service.ts                   (real blocker check on update; auto-assign on create; audit AUTO_ASSIGN)
+src/tickets/tickets.module.ts                    (imports AuditModule; registers deps controller/service)
+test/dependencies-and-autoassign.e2e-spec.ts     (new — 26 cases)
+test/jest-e2e.json                               (maxWorkers: 1 to stop suite interleaving)
+```
+
+### Next session
+- Retrofit `AuditService.record(...)` into every state-changing path
+  (Project create/update/delete, Ticket create/update/delete, User
+  create/update/delete, dependency add/remove). Each call carries the
+  before/after JSON.
+- `GET /audit-logs` with the four query filters (`entityType`, `entityId`,
+  `action`, `actor`).
+- Comments + mentions (mention diff on update).
+- Attachments (10 MB cap, MIME allow-list).
+- CSV import/export.
+- Escalation scheduler.

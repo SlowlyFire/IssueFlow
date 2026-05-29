@@ -9,11 +9,14 @@ import {
 import { InjectRepository } from '@nestjs/typeorm';
 import { IsNull, Not, Repository } from 'typeorm';
 import { QueryDeepPartialEntity } from 'typeorm/query-builder/QueryPartialEntity';
-import { TicketStatus } from '../common/enums';
+import { AuditService } from '../audit/audit.service';
+import { ActorType, TicketStatus } from '../common/enums';
 import { ProjectsService } from '../projects/projects.service';
+import { WorkloadService } from '../projects/workload.service';
 import { UsersService } from '../users/users.service';
 import { CreateTicketDto } from './dto/create-ticket.dto';
 import { UpdateTicketDto } from './dto/update-ticket.dto';
+import { TicketDependenciesService } from './ticket-dependencies.service';
 import { Ticket } from './ticket.entity';
 import {
   assertTransitionAllowed,
@@ -71,14 +74,29 @@ export class TicketsService {
     private readonly tickets: Repository<Ticket>,
     private readonly projects: ProjectsService,
     private readonly users: UsersService,
+    private readonly deps: TicketDependenciesService,
+    private readonly workload: WorkloadService,
+    private readonly audit: AuditService,
   ) {}
 
   async create(dto: CreateTicketDto): Promise<Ticket> {
     // Throws 404 if project missing or soft-deleted.
     await this.projects.findOne(dto.projectId);
-    if (dto.assigneeId !== undefined) {
+
+    // Auto-assignment: only fires when the caller didn't supply an
+    // assigneeId. If supplied, we honor it (after validating it exists).
+    // Never on update — Session 4's update flow already accepts assigneeId
+    // verbatim from the client.
+    let assigneeId: number | null;
+    let autoAssigned = false;
+    if (dto.assigneeId === undefined) {
+      assigneeId = await this.workload.pickAutoAssignee(dto.projectId);
+      autoAssigned = assigneeId !== null;
+    } else {
       await this.users.findOne(dto.assigneeId);
+      assigneeId = dto.assigneeId;
     }
+
     const ticket = this.tickets.create({
       title: dto.title,
       description: dto.description ?? null,
@@ -86,10 +104,25 @@ export class TicketsService {
       priority: dto.priority,
       type: dto.type,
       projectId: dto.projectId,
-      assigneeId: dto.assigneeId ?? null,
+      assigneeId,
       dueDate: dto.dueDate ?? null,
     });
-    return this.tickets.save(ticket);
+    const saved = await this.tickets.save(ticket);
+
+    // Record the auto-assign event ONLY when we actually picked someone.
+    // Other state-changing actions get audited in Session 6.
+    if (autoAssigned) {
+      await this.audit.record({
+        actorType: ActorType.SYSTEM,
+        actorId: null,
+        action: 'AUTO_ASSIGN',
+        entityType: 'Ticket',
+        entityId: saved.id,
+        after: { assigneeId },
+      });
+    }
+
+    return saved;
   }
 
   async findByProject(projectId: number): Promise<Ticket[]> {
@@ -138,14 +171,27 @@ export class TicketsService {
 
     // 3. State-machine transition check (only when status is changing).
     if (dto.status !== undefined && dto.status !== ticket.status) {
+      // Real blocker computation — replaces Session 4's hard-coded `true`.
+      // We compute the list of open (non-DONE, non-soft-deleted) blockers
+      // BOTH so the state-machine receives the real boolean AND so the
+      // catch path can name them in the rejection message. The state
+      // machine remains the single source of truth for the rule; the
+      // service merely enriches the error.
+      let openBlockerIds: number[] = [];
+      let blockersAllDone = true;
+      if (dto.status === TicketStatus.DONE) {
+        openBlockerIds = await this.deps.openBlockerIds(ticket.id);
+        blockersAllDone = openBlockerIds.length === 0;
+      }
       try {
-        assertTransitionAllowed(ticket.status, dto.status, {
-          // TODO(session-5): replace with real blocker computation from
-          // the ticket_dependencies table.
-          blockersAllDone: true,
-        });
+        assertTransitionAllowed(ticket.status, dto.status, { blockersAllDone });
       } catch (e) {
         if (e instanceof InvalidTicketTransitionError) {
+          if (!blockersAllDone) {
+            throw new BadRequestException(
+              `Cannot transition to DONE: blocked by tickets [${openBlockerIds.join(', ')}]`,
+            );
+          }
           throw new BadRequestException(e.message);
         }
         throw e;
