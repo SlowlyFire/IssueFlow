@@ -1,5 +1,6 @@
 import { Module } from '@nestjs/common';
 import { TypeOrmModule } from '@nestjs/typeorm';
+import { AuditModule } from '../audit/audit.module';
 import { AuthModule } from '../auth/auth.module';
 import { Ticket } from '../tickets/ticket.entity';
 import { User } from '../users/user.entity';
@@ -17,6 +18,7 @@ import { WorkloadService } from './workload.service';
     TypeOrmModule.forFeature([Project, Ticket, User]),
     UsersModule,
     AuthModule,
+    AuditModule,
   ],
   controllers: [ProjectsController],
   providers: [ProjectsService, WorkloadService],

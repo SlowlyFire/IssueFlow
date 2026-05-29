@@ -10,6 +10,11 @@ import {
   Post,
 } from '@nestjs/common';
 import { IsInt, Min } from 'class-validator';
+import { actorFrom } from '../audit/actor';
+import {
+  AuthUser,
+  CurrentUser,
+} from '../common/decorators/current-user.decorator';
 import { TicketDependenciesService } from './ticket-dependencies.service';
 import { Ticket } from './ticket.entity';
 
@@ -28,8 +33,9 @@ export class TicketDependenciesController {
   add(
     @Param('ticketId', ParseIntPipe) ticketId: number,
     @Body() dto: AddDependencyDto,
+    @CurrentUser() user: AuthUser,
   ): Promise<void> {
-    return this.deps.addDependency(ticketId, dto.blockedBy);
+    return this.deps.addDependency(ticketId, dto.blockedBy, actorFrom(user));
   }
 
   @Get()
@@ -44,7 +50,8 @@ export class TicketDependenciesController {
   remove(
     @Param('ticketId', ParseIntPipe) ticketId: number,
     @Param('blockerId', ParseIntPipe) blockerId: number,
+    @CurrentUser() user: AuthUser,
   ): Promise<void> {
-    return this.deps.removeDependency(ticketId, blockerId);
+    return this.deps.removeDependency(ticketId, blockerId, actorFrom(user));
   }
 }

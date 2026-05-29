@@ -5,6 +5,9 @@ import {
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { In, Repository } from 'typeorm';
+import { ActorContext } from '../audit/actor';
+import { AuditActions, AuditEntityTypes } from '../audit/audit-actions';
+import { AuditService } from '../audit/audit.service';
 import { TicketStatus } from '../common/enums';
 import { TicketDependency } from './ticket-dependency.entity';
 import { Ticket } from './ticket.entity';
@@ -16,11 +19,16 @@ export class TicketDependenciesService {
     private readonly deps: Repository<TicketDependency>,
     @InjectRepository(Ticket)
     private readonly tickets: Repository<Ticket>,
+    private readonly audit: AuditService,
   ) {}
 
   // ── Public API ──────────────────────────────────────────────────────────────
 
-  async addDependency(ticketId: number, blockedById: number): Promise<void> {
+  async addDependency(
+    ticketId: number,
+    blockedById: number,
+    actor: ActorContext,
+  ): Promise<void> {
     if (ticketId === blockedById) {
       throw new BadRequestException(`A ticket cannot block itself`);
     }
@@ -51,6 +59,8 @@ export class TicketDependenciesService {
 
     // Idempotent: re-adding the same pair is a no-op rather than 409 — the
     // unique composite PK in the DB also enforces uniqueness as a backstop.
+    // No audit row is written on the no-op path: nothing about the system
+    // changed.
     const existing = await this.deps.findOne({
       where: { ticketId, blockedById },
     });
@@ -58,6 +68,14 @@ export class TicketDependenciesService {
       return;
     }
     await this.deps.insert({ ticketId, blockedById });
+    await this.audit.record({
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      action: AuditActions.DEPENDENCY_ADD,
+      entityType: AuditEntityTypes.TICKET,
+      entityId: ticketId,
+      after: { ticketId, blockedById },
+    });
   }
 
   async listDependencies(ticketId: number): Promise<Ticket[]> {
@@ -80,6 +98,7 @@ export class TicketDependenciesService {
   async removeDependency(
     ticketId: number,
     blockedById: number,
+    actor: ActorContext,
   ): Promise<void> {
     const result = await this.deps.delete({ ticketId, blockedById });
     if (result.affected === 0) {
@@ -87,6 +106,15 @@ export class TicketDependenciesService {
         `Dependency (ticket ${ticketId} blocked by ${blockedById}) not found`,
       );
     }
+    await this.audit.record({
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      action: AuditActions.DEPENDENCY_REMOVE,
+      entityType: AuditEntityTypes.TICKET,
+      entityId: ticketId,
+      before: { ticketId, blockedById },
+      after: null,
+    });
   }
 
   // Returns the ids of blockers that are NOT yet DONE (and not soft-deleted).

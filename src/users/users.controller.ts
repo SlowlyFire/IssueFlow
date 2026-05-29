@@ -9,6 +9,11 @@ import {
   ParseIntPipe,
   Post,
 } from '@nestjs/common';
+import { actorFrom } from '../audit/actor';
+import {
+  AuthUser,
+  CurrentUser,
+} from '../common/decorators/current-user.decorator';
 import { Public } from '../common/decorators/public.decorator';
 import { CreateUserDto } from './dto/create-user.dto';
 import { UpdateUserDto } from './dto/update-user.dto';
@@ -42,13 +47,17 @@ export class UsersController {
   update(
     @Param('userId', ParseIntPipe) id: number,
     @Body() dto: UpdateUserDto,
+    @CurrentUser() user: AuthUser,
   ): Promise<void> {
-    return this.users.update(id, dto);
+    return this.users.update(id, dto, actorFrom(user));
   }
 
   @Delete(':userId')
   @HttpCode(HttpStatus.OK)
-  remove(@Param('userId', ParseIntPipe) id: number): Promise<void> {
-    return this.users.remove(id);
+  remove(
+    @Param('userId', ParseIntPipe) id: number,
+    @CurrentUser() user: AuthUser,
+  ): Promise<void> {
+    return this.users.remove(id, actorFrom(user));
   }
 }

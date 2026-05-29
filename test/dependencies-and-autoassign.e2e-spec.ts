@@ -170,8 +170,9 @@ describe('Ticket dependencies + DONE-blocker rule + auto-assignment + workload (
         .expect(404);
     });
 
-    it('audit row written for AUTO_ASSIGN (actor=SYSTEM, action=AUTO_ASSIGN)', async () => {
-      // Truncate tickets + audit so we know the next create is the only one
+    it('AUTO_ASSIGN audit row written alongside the Session-6 TICKET_CREATE row', async () => {
+      // Truncate tickets + audit so we know the next create's rows are the
+      // only ones present.
       const ds = app.get(DataSource);
       await ds.query('TRUNCATE TABLE "tickets" RESTART IDENTITY CASCADE');
       await ds.query('TRUNCATE TABLE "audit_logs" RESTART IDENTITY CASCADE');
@@ -183,50 +184,64 @@ describe('Ticket dependencies + DONE-blocker rule + auto-assignment + workload (
       const ticketId = r.body.id;
       const expectedAssignee = r.body.assigneeId;
 
-      const logs = await ds.getRepository(AuditLog).find();
-      expect(logs.length).toBe(1);
-      expect(logs[0]).toMatchObject({
+      const logs = await ds.getRepository(AuditLog).find({
+        order: { id: 'ASC' },
+      });
+      // Session 6 retrofitted TICKET_CREATE — auto-assigned creates now
+      // produce two audit rows: the user-driven create AND the system-
+      // driven assignment.
+      expect(logs.length).toBe(2);
+      const actions = logs.map((l) => l.action);
+      expect(actions).toContain('TICKET_CREATE');
+      expect(actions).toContain('AUTO_ASSIGN');
+
+      const autoAssign = logs.find((l) => l.action === 'AUTO_ASSIGN')!;
+      expect(autoAssign).toMatchObject({
         actorType: 'SYSTEM',
         actorId: null,
-        action: 'AUTO_ASSIGN',
         entityType: 'Ticket',
         entityId: ticketId,
       });
-      expect(logs[0].afterJson).toEqual({ assigneeId: expectedAssignee });
+      expect(autoAssign.afterJson).toEqual({ assigneeId: expectedAssignee });
     });
 
-    it('no developers → assigneeId is null, no error, no audit row', async () => {
-      // Spin up a project in an environment with no devs (delete users instead).
-      // Easier: change all DEVELOPER roles to ADMIN via POST /users/update/:id.
-      // Demote both devs:
-      for (const u of [devAId, devBId]) {
-        await request(app.getHttpServer())
-          .post(`/users/update/${u}`)
+    describe('no DEVELOPERs in the system', () => {
+      // The dev-role demotion must be reversed even if a downstream
+      // assertion throws — otherwise later workload tests see no
+      // DEVELOPERs and fail with cascading "undefined" errors.
+      afterEach(async () => {
+        for (const u of [devAId, devBId]) {
+          await request(app.getHttpServer())
+            .post(`/users/update/${u}`)
+            .set('Authorization', `Bearer ${adminToken}`)
+            .send({ role: 'DEVELOPER' });
+        }
+      });
+
+      it('assigneeId is null, no AUTO_ASSIGN row (TICKET_CREATE still fires)', async () => {
+        for (const u of [devAId, devBId]) {
+          await request(app.getHttpServer())
+            .post(`/users/update/${u}`)
+            .set('Authorization', `Bearer ${adminToken}`)
+            .send({ role: 'ADMIN' })
+            .expect(200);
+        }
+        const ds = app.get(DataSource);
+        await ds.query('TRUNCATE TABLE "audit_logs" RESTART IDENTITY CASCADE');
+
+        const r = await request(app.getHttpServer())
+          .post('/tickets')
           .set('Authorization', `Bearer ${adminToken}`)
-          .send({ role: 'ADMIN' })
+          .send({ title: 'T-no-devs', type: 'BUG', projectId })
           .expect(200);
-      }
-      const ds = app.get(DataSource);
-      await ds.query('TRUNCATE TABLE "audit_logs" RESTART IDENTITY CASCADE');
+        expect(r.body.assigneeId).toBeNull();
 
-      const r = await request(app.getHttpServer())
-        .post('/tickets')
-        .set('Authorization', `Bearer ${adminToken}`)
-        .send({ title: 'T-no-devs', type: 'BUG', projectId })
-        .expect(200);
-      expect(r.body.assigneeId).toBeNull();
-
-      const logs = await ds.getRepository(AuditLog).find();
-      expect(logs.length).toBe(0); // no auto-assign happened → no audit
-
-      // Restore devs for downstream tests
-      for (const u of [devAId, devBId]) {
-        await request(app.getHttpServer())
-          .post(`/users/update/${u}`)
-          .set('Authorization', `Bearer ${adminToken}`)
-          .send({ role: 'DEVELOPER' })
-          .expect(200);
-      }
+        const logs = await ds.getRepository(AuditLog).find();
+        const actions = logs.map((l) => l.action);
+        // TICKET_CREATE always; AUTO_ASSIGN only when an assignee was
+        // actually picked — which didn't happen here.
+        expect(actions).toEqual(['TICKET_CREATE']);
+      });
     });
   });
 

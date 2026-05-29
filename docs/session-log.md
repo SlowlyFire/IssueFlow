@@ -713,3 +713,185 @@ test/jest-e2e.json                               (maxWorkers: 1 to stop suite in
 - Attachments (10 MB cap, MIME allow-list).
 - CSV import/export.
 - Escalation scheduler.
+
+---
+
+## Session 6 — Audit retrofit across all state-changing ops + GET /audit-logs (2026-05-29)
+
+**Goal:** every state-changing operation lands a row in `audit_logs` with a
+full before/after snapshot and the actor identity. New `GET /audit-logs`
+endpoint (ADMIN-only) lets reviewers query it.
+
+### Action and entity-type constants
+All audit strings live in one file (`src/audit/audit-actions.ts`) as the
+`AuditActions` object literal:
+- USER_CREATE, USER_UPDATE, USER_DELETE
+- PROJECT_CREATE, PROJECT_UPDATE, PROJECT_DELETE, PROJECT_RESTORE
+- TICKET_CREATE, TICKET_UPDATE, TICKET_DELETE, TICKET_RESTORE
+- DEPENDENCY_ADD, DEPENDENCY_REMOVE
+- AUTO_ASSIGN  (already from Session 5)
+
+Entity types are `'User' | 'Project' | 'Ticket'` constants in
+`AuditEntityTypes`. No free-text strings anywhere in service code.
+
+### Snapshot strategy
+
+**Full snapshot, not diff.** Each before/after carries the entire entity at
+that moment in time. Diff-only snapshots would force readers to reconstruct
+prior state by walking back through every prior audit row in chronological
+order — a real pain at 3 a.m. when something broke. With full snapshots, any
+single row is self-contained: open it, see exactly what changed and what the
+state was, no reconstruction required. Storage is cheap; debugging time is
+expensive.
+
+`before` is captured by cloning the loaded entity (shallow spread —
+sufficient because none of our entities have nested objects worth deep
+cloning) BEFORE the mutation. `after` is the entity post-save / post-restore.
+For soft-delete, `after` is the entity with `deletedAt` set, so a reviewer
+can see both the pre-delete state and the deletion timestamp in a single row.
+For hard delete (Users only), `after` is `null` — the row is gone.
+
+**Centralized passwordHash strip.** The `User` entity has `@Exclude()` on
+`passwordHash`, and `class-transformer.instanceToPlain(entity)` honors that —
+so converting an entity to a plain object already drops the hash. But the
+service receives whatever the caller passes (could be an entity, could be a
+plain object), and a future refactor could remove `@Exclude` without
+realising the consequences for audit. So `AuditService.snapshot()`:
+1. Calls `instanceToPlain()` (no-op for plain objects; respects `@Exclude` on
+   entities).
+2. If `entityType === 'User'`, explicitly `delete plain.passwordHash`.
+
+Belt and suspenders. The test "USER_CREATE audit row has no passwordHash"
+asserts this end-to-end.
+
+### Failed operations never leave an audit row
+
+The invariant: **`audit.record()` is the last `await` in every state-
+changing method, after the DB write.** If any earlier step throws — 404
+(not found), 409 (DONE-frozen, dup), 412 (stale or race), 400 (state-machine
+or cycle), 401/403 (guards) — control never reaches the audit call. The
+row in `audit_logs` only exists when the user's mutation actually
+committed.
+
+The catch is that `before` is captured at the top of the method (after the
+load). That's a local variable, not a DB write — it's free to die with the
+function. Four e2e cases lock this down (412 stale If-Match → 0 rows; 428
+missing → 0 rows; 409 DONE-frozen → 0 rows; 404 bad assigneeId on create →
+0 rows).
+
+### Actor identification: how it flows controller → service
+
+Service layer must stay HTTP-agnostic (it shouldn't know `req.user` exists).
+So the controller does the JWT→actor translation and passes a domain object:
+
+- `src/audit/actor.ts` defines `ActorContext = { actorType, actorId }`,
+  plus `SYSTEM_ACTOR` (for scheduler-style callers) and `actorFrom(user)`
+  (controllers' helper).
+- Every state-changing service method has `actorContext` as its last
+  parameter — **not optional**, so you can't forget to pass it. TypeScript
+  catches the omission at compile time.
+- Controllers all use `@CurrentUser() user: AuthUser` and call
+  `actorFrom(user)` once per route.
+
+**Special case: USER_CREATE via public registration.** `POST /users` is
+`@Public`, so there's no JWT and `req.user` is undefined. We resolve this in
+the service: `UsersService.create()` doesn't take `actorContext` at all —
+it generates self-actor (`actorType: USER`, `actorId: saved.id`) right after
+the save. Self-registration → the new user is the audit actor of their own
+creation. Clean story; documented in code.
+
+### Auto-assigned create yields TWO audit rows
+
+By design — the user-driven create (TICKET_CREATE) and the system-driven
+assignment (AUTO_ASSIGN) are two distinct events. They're logged separately
+so an operator can answer "which tickets did the system auto-assign?" with
+a single `?action=AUTO_ASSIGN` filter, separately from "which tickets did
+user X create?" via `?actor=X&action=TICKET_CREATE`. Verified by the
+e2e case "auto-assigned create → TWO rows: TICKET_CREATE + AUTO_ASSIGN";
+manually-assigned create produces only the TICKET_CREATE row.
+
+### GET /audit-logs
+
+- ADMIN-only — `@UseGuards(JwtAuthGuard, RolesGuard) + @Roles(UserRole.ADMIN)`
+  at the controller level (every route in this controller requires ADMIN).
+- Query DTO (`QueryAuditLogsDto`) with class-validator:
+  - `entityType`, `action`: optional strings (kept as plain strings for
+    forward compat — new actions don't have to update an enum).
+  - `entityId`, `actor`: optional positive integers; coerced from query
+    strings via `@Type(() => Number)`.
+  - `from`, `to`: optional ISO timestamps; coerced via `@Type(() => Date)`.
+  - `page` (default 1), `limit` (default 50, `@Max(200)`).
+  - All filters AND-combine.
+- `actor` in the URL is interpreted as `actorId` (per CLAUDE.md / README);
+  the DTO comment names this so reviewers don't have to guess.
+- Sort: `createdAt DESC` (newest first).
+- Response: `{ data, total, page, limit }`.
+
+### One refactoring detail: avoiding a module cycle
+
+Naive wiring would have been: `AuditModule` imports `AuthModule` (for
+`RolesGuard`), `UsersModule` imports `AuditModule` (for the service),
+`AuthModule` imports `UsersModule` (already does). That's a cycle.
+
+Fixed by **providing `JwtAuthGuard` and `RolesGuard` directly in
+`AuditModule`** instead of importing `AuthModule`. Neither guard has any
+service-level dependency on `AuthService` — they only need `Reflector`
+(globally available via `@nestjs/core`) and, in the case of `JwtAuthGuard`,
+the 'jwt' passport strategy which is registered globally once `AuthModule`
+itself initializes elsewhere in the app graph. Nest's DI is happy to have
+the same guard class declared in multiple modules.
+
+### Tests
+- Unit: 33/33 (unchanged).
+- e2e: **88/88 across 6 suites** — 20 new in `audit.e2e-spec.ts`:
+  - **Retrofit:** exactly-one-row for manual-assign create, project
+    update, ticket restore; two-row for auto-assigned create.
+  - **passwordHash filter:** `USER_CREATE.afterJson.passwordHash` is
+    undefined; other fields present.
+  - **Failed-op-no-audit:** 412 stale, 428 missing, 409 DONE-frozen, 404
+    bad assignee.
+  - **GET /audit-logs:** no filter (all rows newest first); by
+    entityType; by action; combined; by actor; pagination (page 2);
+    limit > 200 → 400; bad entityId → 400; DEVELOPER → 403; no token → 401.
+
+Two e2e cases from Session 5 needed updating to reflect that
+auto-assigned creates now yield two rows. One of them was further
+hardened with an `afterEach` that restores demoted devs even if the
+test's assertion throws — otherwise downstream workload tests cascaded
+into "undefined" errors. (Old setup put the restoration inline AFTER
+the failing assertion.) Worth remembering: any test that mutates global
+state should clean up in `afterEach`, not at the end of the test body.
+
+### Files touched
+```
+src/audit/audit-actions.ts                   (new — string constants)
+src/audit/actor.ts                           (new — ActorContext + helper)
+src/audit/audit.service.ts                   (extended: query, snapshot+strip)
+src/audit/dto/query-audit-logs.dto.ts        (new — validated filters)
+src/audit/audit.controller.ts                (new — ADMIN-only GET)
+src/audit/audit.module.ts                    (controller + provides guards locally)
+src/users/user.entity.ts                     (no change — @Exclude already there)
+src/users/users.module.ts                    (imports AuditModule)
+src/users/users.service.ts                   (audit USER_CREATE/UPDATE/DELETE; self-actor for create)
+src/users/users.controller.ts                (passes actor to update/delete)
+src/projects/projects.module.ts              (imports AuditModule)
+src/projects/projects.service.ts             (audit all 4 ops)
+src/projects/projects.controller.ts          (passes actor to all writes)
+src/tickets/tickets.service.ts               (audit TICKET_CREATE/UPDATE/DELETE/RESTORE; AUTO_ASSIGN preserved)
+src/tickets/tickets.controller.ts            (passes actor)
+src/tickets/ticket-dependencies.service.ts   (audit DEPENDENCY_ADD/REMOVE)
+src/tickets/ticket-dependencies.controller.ts(passes actor)
+test/audit.e2e-spec.ts                       (new — 20 cases)
+test/dependencies-and-autoassign.e2e-spec.ts (2 cases updated to expect TICKET_CREATE row; afterEach for role cleanup)
+```
+
+### Next session
+- Comments + mentions (mention-diff logic on update; `mentionedUsers`
+  embedded in responses; `GET /users/:id/mentions` paginated).
+- Attachments (10 MB cap; MIME allow-list).
+- CSV export/import (use `csv-parse` and `csv-stringify`; comma+quote
+  roundtrip is a reviewer-probe).
+- Escalation scheduler.
+- Finally, `run.md` (now overdue — should explain dev setup AND the
+  If-Match / ETag / 428 / 412 contract, the audit query parameters,
+  and the password-on-create decision).

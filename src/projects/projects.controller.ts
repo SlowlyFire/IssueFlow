@@ -11,8 +11,13 @@ import {
   Post,
   UseGuards,
 } from '@nestjs/common';
+import { actorFrom } from '../audit/actor';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { RolesGuard } from '../auth/roles.guard';
+import {
+  AuthUser,
+  CurrentUser,
+} from '../common/decorators/current-user.decorator';
 import { Roles } from '../common/decorators/roles.decorator';
 import { UserRole } from '../common/enums';
 import { CreateProjectDto } from './dto/create-project.dto';
@@ -30,8 +35,11 @@ export class ProjectsController {
 
   @Post()
   @HttpCode(HttpStatus.OK)
-  create(@Body() dto: CreateProjectDto): Promise<Project> {
-    return this.projects.create(dto);
+  create(
+    @Body() dto: CreateProjectDto,
+    @CurrentUser() user: AuthUser,
+  ): Promise<Project> {
+    return this.projects.create(dto, actorFrom(user));
   }
 
   @Get()
@@ -66,21 +74,28 @@ export class ProjectsController {
   update(
     @Param('projectId', ParseIntPipe) id: number,
     @Body() dto: UpdateProjectDto,
+    @CurrentUser() user: AuthUser,
   ): Promise<void> {
-    return this.projects.update(id, dto);
+    return this.projects.update(id, dto, actorFrom(user));
   }
 
   @Delete(':projectId')
   @HttpCode(HttpStatus.OK)
-  softDelete(@Param('projectId', ParseIntPipe) id: number): Promise<void> {
-    return this.projects.softDelete(id);
+  softDelete(
+    @Param('projectId', ParseIntPipe) id: number,
+    @CurrentUser() user: AuthUser,
+  ): Promise<void> {
+    return this.projects.softDelete(id, actorFrom(user));
   }
 
   @Post(':projectId/restore')
   @HttpCode(HttpStatus.OK)
   @UseGuards(JwtAuthGuard, RolesGuard)
   @Roles(UserRole.ADMIN)
-  restore(@Param('projectId', ParseIntPipe) id: number): Promise<void> {
-    return this.projects.restore(id);
+  restore(
+    @Param('projectId', ParseIntPipe) id: number,
+    @CurrentUser() user: AuthUser,
+  ): Promise<void> {
+    return this.projects.restore(id, actorFrom(user));
   }
 }

@@ -9,6 +9,8 @@ import {
 import { InjectRepository } from '@nestjs/typeorm';
 import { IsNull, Not, Repository } from 'typeorm';
 import { QueryDeepPartialEntity } from 'typeorm/query-builder/QueryPartialEntity';
+import { ActorContext } from '../audit/actor';
+import { AuditActions, AuditEntityTypes } from '../audit/audit-actions';
 import { AuditService } from '../audit/audit.service';
 import { ActorType, TicketStatus } from '../common/enums';
 import { ProjectsService } from '../projects/projects.service';
@@ -79,7 +81,7 @@ export class TicketsService {
     private readonly audit: AuditService,
   ) {}
 
-  async create(dto: CreateTicketDto): Promise<Ticket> {
+  async create(dto: CreateTicketDto, actor: ActorContext): Promise<Ticket> {
     // Throws 404 if project missing or soft-deleted.
     await this.projects.findOne(dto.projectId);
 
@@ -109,14 +111,28 @@ export class TicketsService {
     });
     const saved = await this.tickets.save(ticket);
 
-    // Record the auto-assign event ONLY when we actually picked someone.
-    // Other state-changing actions get audited in Session 6.
+    // TICKET_CREATE always — captures who initiated the creation and the
+    // full saved state.
+    await this.audit.record({
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      action: AuditActions.TICKET_CREATE,
+      entityType: AuditEntityTypes.TICKET,
+      entityId: saved.id,
+      after: saved,
+    });
+
+    // AUTO_ASSIGN is an ADDITIONAL row when assignee came from the
+    // workload picker — kept separate so the operator can distinguish
+    // system-driven from user-driven assignment. Carrying both rows means
+    // an auto-assigned-on-create ticket has 2 audit entries; a
+    // manually-assigned one has just the TICKET_CREATE.
     if (autoAssigned) {
       await this.audit.record({
         actorType: ActorType.SYSTEM,
         actorId: null,
-        action: 'AUTO_ASSIGN',
-        entityType: 'Ticket',
+        action: AuditActions.AUTO_ASSIGN,
+        entityType: AuditEntityTypes.TICKET,
         entityId: saved.id,
         after: { assigneeId },
       });
@@ -147,8 +163,13 @@ export class TicketsService {
     id: number,
     dto: UpdateTicketDto,
     ifMatch: string | undefined,
+    actor: ActorContext,
   ): Promise<Ticket> {
     const ticket = await this.findOne(id);
+    // Snapshot before BEFORE we mutate / throw / lock-check. If a later
+    // step throws (409, 412, 400), the audit call at the bottom is never
+    // reached so this snapshot is harmless — no row in audit_logs.
+    const before = { ...ticket };
 
     // 1. DONE-frozen: runs FIRST, before any version logic. A frozen
     // resource should report its frozen-ness, not lie about a missing or
@@ -234,12 +255,35 @@ export class TicketsService {
     }
 
     // 6. Reload and return so the response carries the new version.
-    return this.findOne(id);
+    const after = await this.findOne(id);
+    // 7. Audit AFTER the DB write succeeded. Any throw above (404, 409,
+    // 412, 400 from the state machine, or the race detection 412) skips
+    // this entirely — failed operations never leave a row in audit_logs.
+    await this.audit.record({
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      action: AuditActions.TICKET_UPDATE,
+      entityType: AuditEntityTypes.TICKET,
+      entityId: id,
+      before,
+      after,
+    });
+    return after;
   }
 
-  async softDelete(id: number): Promise<void> {
+  async softDelete(id: number, actor: ActorContext): Promise<void> {
     const ticket = await this.findOne(id);
-    await this.tickets.softRemove(ticket);
+    const before = { ...ticket };
+    const removed = await this.tickets.softRemove(ticket);
+    await this.audit.record({
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      action: AuditActions.TICKET_DELETE,
+      entityType: AuditEntityTypes.TICKET,
+      entityId: id,
+      before,
+      after: removed,
+    });
   }
 
   // ADMIN-only ─────────────────────────────────────────────────────────────────
@@ -252,7 +296,7 @@ export class TicketsService {
     });
   }
 
-  async restore(id: number): Promise<void> {
+  async restore(id: number, actor: ActorContext): Promise<void> {
     const ticket = await this.tickets.findOne({
       withDeleted: true,
       where: { id, deletedAt: Not(IsNull()) },
@@ -260,6 +304,17 @@ export class TicketsService {
     if (!ticket) {
       throw new NotFoundException(`Soft-deleted ticket ${id} not found`);
     }
+    const before = { ...ticket };
     await this.tickets.restore(id);
+    const restored = await this.findOne(id);
+    await this.audit.record({
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      action: AuditActions.TICKET_RESTORE,
+      entityType: AuditEntityTypes.TICKET,
+      entityId: id,
+      before,
+      after: restored,
+    });
   }
 }

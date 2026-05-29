@@ -15,8 +15,13 @@ import {
   UseGuards,
 } from '@nestjs/common';
 import { Response } from 'express';
+import { actorFrom } from '../audit/actor';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { RolesGuard } from '../auth/roles.guard';
+import {
+  AuthUser,
+  CurrentUser,
+} from '../common/decorators/current-user.decorator';
 import { Roles } from '../common/decorators/roles.decorator';
 import { UserRole } from '../common/enums';
 import { CreateTicketDto } from './dto/create-ticket.dto';
@@ -50,9 +55,10 @@ export class TicketsController {
   @HttpCode(HttpStatus.OK)
   async create(
     @Body() dto: CreateTicketDto,
+    @CurrentUser() user: AuthUser,
     @Res({ passthrough: true }) res: Response,
   ): Promise<Ticket> {
-    const ticket = await this.tickets.create(dto);
+    const ticket = await this.tickets.create(dto, actorFrom(user));
     setEtag(res, ticket);
     return ticket;
   }
@@ -90,26 +96,33 @@ export class TicketsController {
     @Param('ticketId', ParseIntPipe) id: number,
     @Body() dto: UpdateTicketDto,
     @Headers('if-match') ifMatch: string | undefined,
+    @CurrentUser() user: AuthUser,
     @Res({ passthrough: true }) res: Response,
   ): Promise<Ticket> {
     // If-Match parsing happens inside the service AFTER the DONE-frozen
     // check, so frozen-ness reports first regardless of header state.
-    const updated = await this.tickets.update(id, dto, ifMatch);
+    const updated = await this.tickets.update(id, dto, ifMatch, actorFrom(user));
     setEtag(res, updated);
     return updated;
   }
 
   @Delete(':ticketId')
   @HttpCode(HttpStatus.OK)
-  softDelete(@Param('ticketId', ParseIntPipe) id: number): Promise<void> {
-    return this.tickets.softDelete(id);
+  softDelete(
+    @Param('ticketId', ParseIntPipe) id: number,
+    @CurrentUser() user: AuthUser,
+  ): Promise<void> {
+    return this.tickets.softDelete(id, actorFrom(user));
   }
 
   @Post(':ticketId/restore')
   @HttpCode(HttpStatus.OK)
   @UseGuards(JwtAuthGuard, RolesGuard)
   @Roles(UserRole.ADMIN)
-  restore(@Param('ticketId', ParseIntPipe) id: number): Promise<void> {
-    return this.tickets.restore(id);
+  restore(
+    @Param('ticketId', ParseIntPipe) id: number,
+    @CurrentUser() user: AuthUser,
+  ): Promise<void> {
+    return this.tickets.restore(id, actorFrom(user));
   }
 }
