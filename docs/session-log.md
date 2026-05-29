@@ -895,3 +895,195 @@ test/dependencies-and-autoassign.e2e-spec.ts (2 cases updated to expect TICKET_C
 - Finally, `run.md` (now overdue — should explain dev setup AND the
   If-Match / ETag / 428 / 412 contract, the audit query parameters,
   and the password-on-create decision).
+
+---
+
+## Session 7 — Comments CRUD + @mention parsing with the diffing rule (2026-05-29)
+
+**Goal:** full comments lifecycle with mentions, the *diff*-on-update
+rule preserving unchanged mention PKs, and the `GET /users/:id/mentions`
+endpoint. Same If-Match optimistic locking as tickets.
+
+### Endpoints (per README contract)
+- `POST /tickets/:ticketId/comments` — `{ content, authorId }`.
+- `GET /tickets/:ticketId/comments` — newest first.
+- `PATCH /tickets/:ticketId/comments/:commentId` — `{ content }` only;
+  requires `If-Match`; sets `ETag` on response.
+- `DELETE /tickets/:ticketId/comments/:commentId` — hard delete (Comment
+  has no `@DeleteDateColumn`).
+- `GET /users/:userId/mentions?page=&pageSize=` — paginated, newest first,
+  returns `{ data, total, page }`.
+
+Every comment response (POST, GET list, PATCH, mentions endpoint) carries
+`mentionedUsers: [{ id, username, fullName }]`. The query that builds
+this list is a single `INNER JOIN Mention ON Mention.commentId IN (:ids)`
+joined with `User`, grouped in memory — explicitly **no N+1**, regardless
+of the page size.
+
+### The mention parser
+
+Pure function in `src/comments/mention-parser.ts`. The regex:
+
+```
+/(?<!\w)@(\w(?:[\w.-]*\w)?)/g
+```
+
+Three pieces:
+- `(?<!\w)` — negative lookbehind. `@` must NOT be preceded by a word
+  character. This is what eliminates `alice@example.com` (the `@` follows
+  `e`, a word char). `\w` includes the underscore, so `user_@alice` is
+  also correctly *not* a mention — consistent rule: an `@` that looks
+  like it's continuing a word is an email fragment, not a mention. The
+  lookbehind matches start-of-string, whitespace, newline, and most
+  punctuation including another `@` — so `@@alice` matches `alice` once.
+- `(\w(?:[\w.-]*\w)?)` — the capture group. Must **start and end** with a
+  word character. The inner part allows dots and dashes for compound
+  usernames (`john.doe`, `mary-jane`). The "must end with word char"
+  constraint is what strips trailing `.` `,` `:` `?` punctuation from
+  the match without a separate post-processing step.
+- `g` flag → all matches, not just the first.
+
+Output is lowercased, deduplicated, preserves first-seen order. 16 unit
+cases pin all the edge behavior (`@alice.`, `@@alice`, multiline, email
+non-match, case-insensitive dedup, trailing punctuation in all flavors,
+internal dots/dashes, the lone-`@` case, tabs).
+
+TDD order: spec first, watched it fail with `TS2307` (no module yet),
+implemented, all green on first try.
+
+### Resolution (separate concern from parsing)
+
+`CommentsService.resolveMentionsFromContent()` takes the parser's
+deduped lowercase candidates and does **one** query:
+
+```sql
+SELECT u.id FROM users u WHERE LOWER(u.username) IN (...candidates)
+```
+
+So:
+- Unknown `@names` silently drop out (no error, no row written).
+- `@ALICE` and `@alice` both resolve to the user `alice` because of the
+  `LOWER()` on both sides — verified end-to-end.
+- One query regardless of mention count.
+
+### The diff (the central thing)
+
+`PATCH /tickets/:ticketId/comments/:commentId` inside a transaction:
+
+```
+1. Lock-check (parse If-Match, compare to comment.version → 412 if stale)
+2. Atomic conditional UPDATE comment SET content=…, version=version+1
+   WHERE id=:id AND version=:expected     ← race defense same as tickets
+3. existing = SELECT * FROM mentions WHERE commentId=:id       → set OLD
+4. new = resolveMentionsFromContent(new content)               → set NEW
+5. toInsert = NEW \ OLD
+   toDelete = OLD \ NEW
+   unchanged = NEW ∩ OLD
+6. If toDelete: DELETE FROM mentions WHERE commentId=:id AND mentionedUserId IN (toDelete)
+7. If toInsert: INSERT INTO mentions (commentId, mentionedUserId) VALUES …
+8. Unchanged rows are NEVER touched
+```
+
+**Why diff vs delete-and-recreate.** Delete-and-recreate would change
+the PK of every mention row on every comment edit. Three problems:
+1. Downstream consumers (a future "see who first mentioned you, and
+   when" feature, say) would see every mention row's createdAt reset on
+   any unrelated edit to the comment.
+2. Foreign-key references to the Mention table (none today, but possible
+   later) would break or need cascade.
+3. The audit gets noisier — every edit looks like a complete reshuffle
+   instead of "added one, removed one."
+
+Diff costs one read (`existing = SELECT * FROM mentions WHERE …`), one
+conditional DELETE, one conditional INSERT — typically fewer writes
+than delete-and-recreate when the overlap is large. Tested by an e2e
+that captures bob's mention-row PK before and after a `@alice@bob → @bob@charlie`
+PATCH and asserts `bobAfter.id === bobBefore.id`. Same test also confirms
+alice's row is gone and charlie's is new with a different PK.
+
+### Why this is the ONE place we transact
+
+Audit calls live OUTSIDE transactions; if the audit row fails to write,
+we lose a historical entry, which is **recoverable manually** and doesn't
+corrupt user-visible data.
+
+The mention diff is different: if the comment UPDATE commits but the
+mention INSERT/DELETE fails, the mention rows disagree with the comment
+content **forever**. Users see "@alice" in the rendered comment but
+aren't notified, or get notified for mentions that no longer exist. There
+is no observable surface for an operator to detect this — no error
+ever surfaces, the data is just quietly wrong. So the comment UPDATE +
+mention diff happen in `dataSource.transaction(...)` together;
+audit goes after the txn commits.
+
+POST and DELETE on comments are also wrapped in transactions for the same
+reason — INSERT comment + INSERT mentions must be all-or-nothing on POST,
+DELETE mentions + DELETE comment must be all-or-nothing on DELETE
+(otherwise orphan mention rows pile up pointing at deleted comments —
+there's no FK constraint enforcing this, we enforce it in code).
+
+### Audit row for COMMENT_UPDATE
+
+`before` is the full comment-row snapshot before the txn. `after` is the
+full comment-row snapshot after the UPDATE, **plus** a `mentionDiff`
+key (`{ added: [...uids], removed: [...uids], unchanged: [...uids] }`).
+So an operator reading the audit row sees:
+- What the content was, what it became (in `content`).
+- Which user ids were added/removed/kept-as-mentions (in `mentionDiff`).
+
+Pinned by an e2e that wipes audit_logs before the PATCH and asserts the
+single COMMENT_UPDATE row's `mentionDiff` matches `{ added: [bobId],
+removed: [aliceId], unchanged: [] }`.
+
+### Refactor along the way
+
+`parseIfMatch` lived inside `tickets.service.ts` as a private function
+in Session 4. Comments needed the identical contract, so it moved to
+`src/common/if-match.ts` and is now imported by both services. The error
+messages are slightly more generic now ("for updates" instead of "for
+ticket updates"), but no functional change. All prior tests still green.
+
+### Tests
+- Unit: **49/49** (16 new mention-parser cases + 33 carried over).
+- e2e: **107/107 across 7 suites** (19 new in `comments.e2e-spec.ts`):
+  - POST: mentioned-users embed shape, unknown silently ignored,
+    case-insensitive resolve, 404 bad authorId, 404 bad ticketId,
+    forbidNonWhitelisted on extra fields.
+  - GET list: newest first, embedded mentions on every row.
+  - **PATCH diff** (the central one): bob's mention PK is unchanged
+    across the swap. Plus a "swap mention order, no diff" case.
+  - PATCH audit: `mentionDiff: { added, removed, unchanged }` exactly
+    matches expectations.
+  - If-Match contract: 428 missing, 412 stale, 200 with version bump
+    and new ETag.
+  - DELETE: mention rows also gone in the same txn.
+  - `GET /users/:id/mentions`: filtered correctly, newest first,
+    `pageSize=2` pagination, zero-mentions returns `{ total: 0, data: [] }`,
+    unknown userId → 404.
+
+### Files touched
+```
+src/common/if-match.ts                      (extracted from tickets.service)
+src/tickets/tickets.service.ts              (import parseIfMatch from common)
+src/audit/audit-actions.ts                  (COMMENT_CREATE/UPDATE/DELETE + COMMENT entity type)
+src/comments/mention-parser.ts              (new — pure function)
+src/comments/mention-parser.spec.ts         (new — 16 cases TDD)
+src/comments/comments.service.ts            (new — CRUD + diff txn + N+1-free enrichment)
+src/comments/comments.controller.ts         (new — /tickets/:ticketId/comments routes)
+src/comments/user-mentions.controller.ts    (new — GET /users/:userId/mentions)
+src/comments/dto/create-comment.dto.ts      (new)
+src/comments/dto/update-comment.dto.ts      (new — content only)
+src/comments/dto/query-user-mentions.dto.ts (new — page + pageSize)
+src/comments/comments.module.ts             (controllers + service; forFeature(Comment, Mention, User, Ticket))
+test/comments.e2e-spec.ts                   (new — 19 cases)
+```
+
+### Next session
+- Attachments (10 MB cap; MIME allow-list: png, jpeg, pdf, text/plain).
+- CSV export/import (use `csv-parse` and `csv-stringify`; comma+quote
+  roundtrip is a reviewer-probe).
+- Escalation scheduler.
+- `run.md` — explicitly overdue now. Needs to cover: docker compose
+  bring-up, .env setup, npm scripts, the If-Match / ETag contract for
+  PATCH on tickets and comments, the audit query parameters,
+  password-on-create, and the unusual `POST /users/update/:id` path.

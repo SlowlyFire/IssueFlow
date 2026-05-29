@@ -13,6 +13,7 @@ import { ActorContext } from '../audit/actor';
 import { AuditActions, AuditEntityTypes } from '../audit/audit-actions';
 import { AuditService } from '../audit/audit.service';
 import { ActorType, TicketStatus } from '../common/enums';
+import { parseIfMatch } from '../common/if-match';
 import { ProjectsService } from '../projects/projects.service';
 import { WorkloadService } from '../projects/workload.service';
 import { UsersService } from '../users/users.service';
@@ -24,24 +25,6 @@ import {
   assertTransitionAllowed,
   InvalidTicketTransitionError,
 } from './ticket-state-machine';
-
-function parseIfMatch(ifMatch: string | undefined): number {
-  if (ifMatch === undefined || ifMatch === '') {
-    throw new HttpException(
-      'If-Match header is required for ticket updates (carry the version you loaded, e.g. If-Match: "3")',
-      HttpStatus.PRECONDITION_REQUIRED, // 428
-    );
-  }
-  // Tolerate quoted or unquoted, and weak ETags: '"3"', '3', 'W/"3"' all fine.
-  const normalized = ifMatch.replace(/^W\//, '').replace(/"/g, '').trim();
-  const v = Number(normalized);
-  if (!Number.isInteger(v) || v < 0) {
-    throw new BadRequestException(
-      'If-Match must be a non-negative integer (the ticket version)',
-    );
-  }
-  return v;
-}
 
 // Mirrors the soft-delete pattern documented in projects.service.ts:
 //   - standard reads exclude deletedAt IS NOT NULL automatically (TypeORM)

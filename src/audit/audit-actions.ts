@@ -20,6 +20,10 @@ export const AuditActions = {
   DEPENDENCY_ADD: 'DEPENDENCY_ADD',
   DEPENDENCY_REMOVE: 'DEPENDENCY_REMOVE',
 
+  COMMENT_CREATE: 'COMMENT_CREATE',
+  COMMENT_UPDATE: 'COMMENT_UPDATE',
+  COMMENT_DELETE: 'COMMENT_DELETE',
+
   AUTO_ASSIGN: 'AUTO_ASSIGN',
 } as const;
 
@@ -29,6 +33,7 @@ export const AuditEntityTypes = {
   USER: 'User',
   PROJECT: 'Project',
   TICKET: 'Ticket',
+  COMMENT: 'Comment',
 } as const;
 
 export type AuditEntityType =
