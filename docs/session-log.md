@@ -1455,3 +1455,30 @@ test/csv.e2e-spec.ts              (new — 13 cases)
   docker compose + .env setup, npm scripts, the If-Match / ETag contract,
   password-on-create decision, UPLOADS_DIR, ESCALATION_CRON, the escalation
   demo via `POST /admin/escalate-now`, and the CSV export/import workflow.
+
+---
+
+## Polish session — run.md (2026-05-29)
+
+**Goal:** write `run.md` for a reviewer cloning the repo cold, optimised for
+the ~5-minute window they have to get it running.
+
+### Structure
+Nine sections: Prerequisites, Quick start, Environment variables (table),
+Verifying it works (four-step copy-pasteable curl tour), Running the tests,
+Manual escalation trigger, Database reset, Design decisions worth knowing,
+Troubleshooting.
+
+### Verification
+Every command in the document was tested against a live dev server except
+`git clone` (already in the repo). Confirmed:
+- Steps 1–4 of the curl tour produce the exact responses described.
+- `POST /admin/escalate-now` returns `{ scanned, escalated, criticalMarked }`.
+- `npm test` → 58 passed, 58 total.
+- `npm run test:e2e` → 153 passed, 153 total (10 suites, ~6 seconds).
+
+### Files touched
+```
+run.md          (new)
+docs/session-log.md  (this entry)
+```
