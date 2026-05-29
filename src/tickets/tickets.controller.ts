@@ -1,4 +1,5 @@
 import {
+  BadRequestException,
   Body,
   Controller,
   Delete,
@@ -12,9 +13,13 @@ import {
   Post,
   Query,
   Res,
+  UploadedFile,
   UseGuards,
+  UseInterceptors,
 } from '@nestjs/common';
+import { FileInterceptor } from '@nestjs/platform-express';
 import { Response } from 'express';
+import { memoryStorage } from 'multer';
 import { actorFrom } from '../audit/actor';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { RolesGuard } from '../auth/roles.guard';
@@ -28,7 +33,7 @@ import { CreateTicketDto } from './dto/create-ticket.dto';
 import { ListTicketsDto } from './dto/list-tickets.dto';
 import { UpdateTicketDto } from './dto/update-ticket.dto';
 import { Ticket } from './ticket.entity';
-import { TicketsService } from './tickets.service';
+import { ImportResult, TicketsService } from './tickets.service';
 
 // ─── Optimistic concurrency contract for PATCH /tickets/:ticketId ─────────────
 // Every PATCH MUST send an `If-Match` header carrying the version the client
@@ -63,11 +68,58 @@ export class TicketsController {
     return ticket;
   }
 
+  // POST /tickets/import — multipart/form-data with fields: file (CSV), projectId.
+  // Declared before @Post(':ticketId/restore') so the static segment "import"
+  // is matched first (Express resolves routes top-to-bottom in registration order).
+  @Post('import')
+  @HttpCode(HttpStatus.OK)
+  @UseInterceptors(FileInterceptor('file', { storage: memoryStorage() }))
+  async importCsv(
+    @UploadedFile() file: Express.Multer.File,
+    @Body('projectId', ParseIntPipe) projectId: number,
+    @CurrentUser() user: AuthUser,
+  ): Promise<ImportResult> {
+    if (!file) {
+      throw new BadRequestException('CSV file is required (field name: "file")');
+    }
+    // Reject files whose declared MIME type is obviously not text-based.
+    // csv-parse will catch any structural issues during parsing; this check is
+    // a fast-fail for binary uploads (images, PDFs) that would never be valid CSV.
+    const ALLOWED_MIMES = [
+      'text/csv',
+      'text/plain',
+      'application/octet-stream',
+      'application/vnd.ms-excel',
+    ];
+    if (!ALLOWED_MIMES.includes(file.mimetype)) {
+      throw new BadRequestException(
+        `File must be a CSV (text/csv or text/plain); received ${file.mimetype}`,
+      );
+    }
+    return this.tickets.importCsv(projectId, file.buffer, actorFrom(user));
+  }
+
   // The README's list endpoint is GET /tickets?projectId=:projectId — a query
   // param, not a nested resource path. Validated via ListTicketsDto.
   @Get()
   findByProject(@Query() query: ListTicketsDto): Promise<Ticket[]> {
     return this.tickets.findByProject(query.projectId);
+  }
+
+  // GET /tickets/export — must be declared before GET /tickets/:ticketId so
+  // the static segment "export" is matched before the dynamic param catches it
+  // and ParseIntPipe tries (and fails) to parse "export" as an integer.
+  @Get('export')
+  async exportCsv(
+    @Query('projectId', ParseIntPipe) projectId: number,
+    @Res() res: Response,
+  ): Promise<void> {
+    const csv = await this.tickets.exportCsv(projectId);
+    res.set({
+      'Content-Type': 'text/csv',
+      'Content-Disposition': `attachment; filename="tickets-${projectId}.csv"`,
+    });
+    res.send(csv);
   }
 
   // IMPORTANT: /tickets/deleted MUST be declared before /tickets/:ticketId

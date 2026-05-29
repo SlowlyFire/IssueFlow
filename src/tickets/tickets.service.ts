@@ -6,13 +6,15 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
+import { parse } from 'csv-parse/sync';
+import { stringify } from 'csv-stringify/sync';
 import { InjectRepository } from '@nestjs/typeorm';
 import { IsNull, Not, Repository } from 'typeorm';
 import { QueryDeepPartialEntity } from 'typeorm/query-builder/QueryPartialEntity';
 import { ActorContext } from '../audit/actor';
 import { AuditActions, AuditEntityTypes } from '../audit/audit-actions';
 import { AuditService } from '../audit/audit.service';
-import { ActorType, TicketStatus } from '../common/enums';
+import { ActorType, TicketPriority, TicketStatus, TicketType } from '../common/enums';
 import { parseIfMatch } from '../common/if-match';
 import { ProjectsService } from '../projects/projects.service';
 import { WorkloadService } from '../projects/workload.service';
@@ -308,4 +310,163 @@ export class TicketsService {
       after: restored,
     });
   }
+
+  // ── CSV export / import (3.4) ────────────────────────────────────────────
+
+  // Export columns in exact spec order: id, title, description, status,
+  // priority, type, assigneeId. Uses csv-stringify so commas, quotes, and
+  // embedded newlines in title/description are properly escaped.
+  async exportCsv(projectId: number): Promise<string> {
+    await this.projects.findOne(projectId);
+    const tickets = await this.tickets.find({
+      where: { projectId },
+      order: { id: 'ASC' },
+    });
+    return stringify(
+      tickets.map((t) => ({
+        id: t.id,
+        title: t.title,
+        description: t.description ?? '',
+        status: t.status,
+        priority: t.priority,
+        type: t.type,
+        assigneeId: t.assigneeId ?? '',
+      })),
+      {
+        header: true,
+        columns: [
+          'id',
+          'title',
+          'description',
+          'status',
+          'priority',
+          'type',
+          'assigneeId',
+        ],
+      },
+    );
+  }
+
+  async importCsv(
+    projectId: number,
+    buffer: Buffer,
+    actor: ActorContext,
+  ): Promise<ImportResult> {
+    await this.projects.findOne(projectId);
+
+    // Atomicity decision: each row is its own independent transaction (via the
+    // existing TicketsService.create() call). Partial success is intentional —
+    // one bad row must not roll back the rows already created. The caller sees
+    // created/failed/errors and can decide what to do with failed rows. An
+    // all-or-nothing import would require a manual saga/rollback and would make
+    // the endpoint much harder to use for bulk data correction workflows.
+    let rows: Record<string, string>[];
+    try {
+      rows = parse(buffer, {
+        columns: true,
+        trim: true,
+        skip_empty_lines: true,
+      }) as Record<string, string>[];
+    } catch (err) {
+      throw new BadRequestException(
+        `CSV parse error: ${(err as Error).message}`,
+      );
+    }
+
+    const result: ImportResult = { created: 0, failed: 0, errors: [] };
+
+    for (let i = 0; i < rows.length; i++) {
+      const rowNum = i + 1; // 1-indexed — humans count from 1
+      const row = rows[i];
+      try {
+        // --- Field-level validation ---
+        if (!row.title || !row.title.trim()) {
+          throw new Error('title is required');
+        }
+        if (row.title.trim().length > 300) {
+          throw new Error('title must not exceed 300 characters');
+        }
+        if (!row.status) {
+          throw new Error('status is required');
+        }
+        if (!Object.values(TicketStatus).includes(row.status as TicketStatus)) {
+          throw new Error(
+            `invalid status "${row.status}"; must be one of: ${Object.values(TicketStatus).join(', ')}`,
+          );
+        }
+        // Mirror the CreateTicketDto rule: DONE cannot be the initial status.
+        if ((row.status as TicketStatus) === TicketStatus.DONE) {
+          throw new Error(
+            'tickets cannot be imported in DONE status; transition to DONE via PATCH after import',
+          );
+        }
+        if (!row.priority) {
+          throw new Error('priority is required');
+        }
+        if (
+          !Object.values(TicketPriority).includes(row.priority as TicketPriority)
+        ) {
+          throw new Error(
+            `invalid priority "${row.priority}"; must be one of: ${Object.values(TicketPriority).join(', ')}`,
+          );
+        }
+        if (!row.type) {
+          throw new Error('type is required');
+        }
+        if (!Object.values(TicketType).includes(row.type as TicketType)) {
+          throw new Error(
+            `invalid type "${row.type}"; must be one of: ${Object.values(TicketType).join(', ')}`,
+          );
+        }
+
+        // --- Parse optional assigneeId ---
+        // If the CSV field is absent or empty → omit from DTO → auto-assign
+        // fires in create(), same as a POST /tickets without assigneeId.
+        // If present → parse as integer and pass to create(), which validates
+        // the referenced user exists (404 → caught below → added to errors).
+        let assigneeId: number | undefined;
+        if (row.assigneeId && row.assigneeId.trim()) {
+          const parsed = parseInt(row.assigneeId.trim(), 10);
+          if (isNaN(parsed)) {
+            throw new Error(
+              `invalid assigneeId "${row.assigneeId}"; must be an integer`,
+            );
+          }
+          assigneeId = parsed;
+        }
+
+        // --- Delegate to create() — no duplication of auto-assign / audit ---
+        // create() handles: project validation (cheap, already verified above),
+        // auto-assign when assigneeId is absent, TICKET_CREATE audit row, and
+        // AUTO_ASSIGN audit row when auto-picked. This is the same code path as
+        // POST /tickets; the import is strictly a bulk front-door to that path.
+        const dto: CreateTicketDto = {
+          title: row.title.trim(),
+          description: row.description || undefined,
+          status: row.status as TicketStatus,
+          priority: row.priority as TicketPriority,
+          type: row.type as TicketType,
+          projectId,
+          assigneeId,
+        };
+
+        await this.create(dto, actor);
+        result.created++;
+      } catch (err) {
+        result.failed++;
+        result.errors.push({
+          row: rowNum,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+
+    return result;
+  }
+}
+
+export interface ImportResult {
+  created: number;
+  failed: number;
+  errors: { row: number; error: string }[];
 }

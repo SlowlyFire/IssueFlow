@@ -1331,3 +1331,127 @@ GET  /audit-logs?action=AUTO_ESCALATE             →  [{ actorType: "SYSTEM", a
   docker compose up, .env setup, npm scripts, the If-Match/ETag contract,
   password-on-create decision, UPLOADS_DIR, and the escalation demo
   (POST /admin/escalate-now).
+
+---
+
+## Session 10 — CSV export/import (2026-05-29)
+
+**Goal:** `GET /tickets/export` and `POST /tickets/import`. Final feature session.
+
+### Part A — Export (`GET /tickets/export?projectId={id}`)
+
+**Service:** `TicketsService.exportCsv(projectId)` — validates the project (404 if
+missing), fetches all non-soft-deleted tickets ordered by id, maps to plain
+objects with empty string for null `description`/`assigneeId`, then calls
+`stringify()` from `csv-stringify/sync` with `{ header: true, columns: [...] }`.
+The `columns` array both specifies the output order and serves as the header
+row — no free-text split, no hand-rolled escaping.
+
+**Controller:** `@Get('export')` declared before `@Get(':ticketId')` so the
+static string "export" is matched before Express tries to parse it as an integer
+id. Sends the CSV string via `res.send()` with
+`Content-Type: text/csv` and `Content-Disposition: attachment; filename="tickets-{id}.csv"`.
+
+**Verified live:**
+```
+GET /tickets/export?projectId=1
+→  id,title,description,status,priority,type,assigneeId
+   2,"Fix ""the bug"", urgently",,TODO,HIGH,BUG,3
+```
+`csv-stringify` RFC-4180 encodes the title: the outer quotes wrap the field,
+inner `"` become `""`, and the `,` inside is safe inside the quoted field.
+
+### Part B — Import (`POST /tickets/import`)
+
+**Multipart fields:** `file` (CSV file) + `projectId` (form field as string →
+`ParseIntPipe` → integer).
+
+**MIME guard** (in the controller before the service): rejects `image/*`,
+`application/pdf`, etc. Allowed: `text/csv`, `text/plain`,
+`application/octet-stream`, `application/vnd.ms-excel`. Fast-fail for obvious
+binary files that would never be valid CSV.
+
+**Parsing:** `parse()` from `csv-parse/sync` with `{ columns: true, trim: true,
+skip_empty_lines: true }`. If the buffer is not parseable as CSV at all (truly
+corrupt), throws 400 at this level.
+
+**Row-level validation** (per-row, inside the for-loop):
+- `title` required, max 300 chars
+- `status` must be a `TicketStatus` enum value and not `DONE` (mirrors the
+  `CreateTicketDto` `@NotEquals(DONE)` rule that the import bypasses by calling
+  the service directly)
+- `priority` must be a `TicketPriority` enum value
+- `type` must be a `TicketType` enum value
+- `assigneeId` if present and non-empty: `parseInt` + isNaN check
+
+**Delegation to `create()`:** instead of duplicating the ticket-creation logic,
+each valid row is passed to `TicketsService.create(dto, actor)`. This picks up:
+auto-assign if `assigneeId` is absent, the `TICKET_CREATE` audit row, and the
+`AUTO_ASSIGN` audit row if auto-picked. Documented in the service with a comment.
+
+**Atomicity decision:** each row is its own independent commit (no wrapping
+transaction across the whole import). Partial success is intentional:
+- A CSV with 100 rows and one bad row should not roll back the 99 good ones.
+- Batch data correction workflows require partial success to be useful.
+- An all-or-nothing import would need a manual saga/rollback and would make
+  re-running after a fix much more painful.
+- The caller receives `{ created, failed, errors: [{row, error}] }` and can
+  correct and re-submit the failed rows.
+
+`row` numbers in `errors` are 1-indexed — humans count from 1.
+
+**Route ordering for `@Post('import')`:** `import` is a single-segment static
+path. `@Post(':ticketId/restore')` requires two segments (`/:id/restore`).
+`POST /tickets/import` cannot match `@Post(':ticketId/restore')` so ordering
+between them is a non-issue — both patterns can coexist in any order. Declared
+before the dynamic restore route for readability.
+
+### curl demo (confirmed live)
+
+```
+# Export with comma+quote in title
+GET /tickets/export?projectId=1
+→  id,title,description,status,priority,type,assigneeId
+   2,"Fix ""the bug"", urgently",,TODO,HIGH,BUG,3
+
+# Re-import into new project
+POST /tickets/import  (multipart: file=<above CSV>, projectId=2)
+→  { created: 1, failed: 0, errors: [] }
+
+GET /tickets?projectId=2
+→  [{ title: 'Fix "the bug", urgently', priority: 'HIGH' }]   ← identical
+
+# Row-level error: 3 rows, middle row has invalid priority
+POST /tickets/import  (3 rows, row 2: priority=NOT_REAL)
+→  { created: 2, failed: 1, errors: [{ row: 2, error: 'invalid priority "NOT_REAL"; ...' }] }
+```
+
+### Tests
+- Unit: **58/58** (unchanged).
+- e2e: **153/153** across **10 suites** (13 new in `csv.e2e-spec.ts`):
+  - Export: comma+quote in title roundtrip (the spec-flagged probe).
+  - Export: newline in description roundtrip.
+  - Export: seven columns in exact spec order.
+  - Export: 404 for unknown project.
+  - Import roundtrip: export → import into new project → fields match.
+  - Import: one bad row out of three → created: 2, failed: 1, errors[0].row === 2.
+  - Import: status=DONE row → failed with clear message.
+  - Import: row without assigneeId → auto-assigned to the only DEVELOPER.
+  - Import: empty CSV (header-only) → { created: 0, failed: 0, errors: [] }.
+  - Import: PNG file → 400 mentioning "csv".
+  - Import: 404 for unknown project.
+  - Export: 401 without token.
+  - Import: 401 without token.
+
+### Files touched
+```
+src/tickets/tickets.service.ts    (exportCsv + importCsv + ImportResult; TicketPriority/Type imports; csv-parse/stringify imports)
+src/tickets/tickets.controller.ts (GET /tickets/export + POST /tickets/import; FileInterceptor imports)
+test/csv.e2e-spec.ts              (new — 13 cases)
+```
+
+### What remains
+- `run.md` — the one deliverable still missing before submission. Needs:
+  docker compose + .env setup, npm scripts, the If-Match / ETag contract,
+  password-on-create decision, UPLOADS_DIR, ESCALATION_CRON, the escalation
+  demo via `POST /admin/escalate-now`, and the CSV export/import workflow.
