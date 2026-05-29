@@ -7,6 +7,7 @@ import {
   Logger,
 } from '@nestjs/common';
 import { Request, Response } from 'express';
+import { MulterError } from 'multer';
 
 @Catch()
 export class AllExceptionsFilter implements ExceptionFilter {
@@ -32,6 +33,16 @@ export class AllExceptionsFilter implements ExceptionFilter {
         message = (r.message as string | string[]) ?? exception.message;
         error = (r.error as string) ?? exception.name;
       }
+    } else if (exception instanceof MulterError) {
+      // Multer size-limit errors arrive here when FileInterceptor's
+      // limits.fileSize is exceeded. Treat as a 400 so callers get the
+      // same { statusCode, message, error, timestamp, path } shape.
+      statusCode = HttpStatus.BAD_REQUEST;
+      error = 'Bad Request';
+      message =
+        exception.code === 'LIMIT_FILE_SIZE'
+          ? 'File exceeds the 10 MB size limit'
+          : `Upload error: ${exception.message}`;
     } else if (exception instanceof Error) {
       message = exception.message;
       this.logger.error(exception.stack);

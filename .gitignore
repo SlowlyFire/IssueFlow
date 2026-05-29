@@ -3,6 +3,9 @@
 /node_modules
 /build
 
+# uploaded files (local filesystem storage — production uses object storage)
+/uploads
+
 # Logs
 logs
 *.log

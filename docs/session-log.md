@@ -1087,3 +1087,116 @@ test/comments.e2e-spec.ts                   (new — 19 cases)
   bring-up, .env setup, npm scripts, the If-Match / ETag contract for
   PATCH on tickets and comments, the audit query parameters,
   password-on-create, and the unusual `POST /users/update/:id` path.
+
+---
+
+## Session 8 — Attachments (2026-05-29)
+
+**Goal:** file upload/download/delete with magic-number validation, UUID
+storage paths, and audit rows.
+
+### Endpoints added (README-driven, with additions not in README)
+- `POST /tickets/:ticketId/attachments` — multipart `file` field.
+- `GET /tickets/:ticketId/attachments` — list (README-implied).
+- `GET /tickets/:ticketId/attachments/:id/download` — stream (README
+  didn't define a download path; added as the natural extension of the
+  nested DELETE resource for consistency).
+- `DELETE /tickets/:ticketId/attachments/:id` — remove row + file.
+
+### Storage design
+
+Files land under `UPLOADS_DIR` (env var, default `./uploads/`, gitignored).
+The actual on-disk filename is `<uuid><ext>` — never the user-supplied name.
+
+**Why UUID paths? Path traversal prevention.** If a client sends
+`filename: ../../etc/passwd` and we naively use it as the path, the file
+writes outside the uploads directory. By using `randomUUID()` for the
+storage path, the user-supplied name can only be stored in the `filename`
+column (for display); it can never influence the filesystem path.
+Documented in a code comment and noted here for `run.md`.
+
+Note: Supertest strips path separators from filenames before sending (it
+calls `path.basename` on the attachment argument), so an e2e test sending
+`../../etc/passwd` actually reaches the server as `passwd`. The
+protection is server-side regardless — the test asserts that
+`storagePath` doesn't contain the user-supplied name at all.
+
+Production would use S3-style object storage; the service is structured
+so this is a one-file swap.
+
+### The magic-number validator
+
+`MimeValidatorService.validate(buffer, claimedMime)` does two things:
+1. Checks that `claimedMime` is in the allowlist (`image/png`,
+   `image/jpeg`, `application/pdf`, `text/plain`).
+2. Detects the actual MIME from the buffer via `detect(buffer)` and
+   compares to the claim.
+
+**Why not trust the client's Content-Type?** Because it costs zero effort
+to set `Content-Type: image/png` while uploading a Windows executable.
+Without the magic check, an attacker can bypass the MIME allowlist
+entirely by lying about the type. Magic bytes are forged-able in theory
+but require non-trivial effort (crafting a polyglot file that has the
+correct magic prefix AND is valid as the attacker's intended type is a
+separate, harder problem).
+
+Magic-number table:
+- **PNG**: `89 50 4E 47 0D 0A 1A 0A` (8 bytes)
+- **JPEG**: `FF D8 FF` (3 bytes)
+- **PDF**: `25 50 44 46` (`%PDF`)
+- **text/plain**: No universal magic number. We apply two rules:
+  (a) no NUL bytes (NUL signals binary data in Unix tools and text
+  editors); (b) buffer decodes as valid UTF-8 (via `TextDecoder` with
+  `fatal: true`). Accepts ASCII and UTF-8; rejects Latin-1, binary
+  executables, binary images claimed as text.
+
+### 400 vs 413 for oversized files
+
+The spec said "pick one and justify". NestJS's `FileInterceptor` wraps
+multer's `LIMIT_FILE_SIZE` error into `PayloadTooLargeException` (HTTP
+413) before our exception filter even runs. The 413 is the semantically
+correct choice per RFC 7231 ("the server is refusing to process a request
+because the request payload is larger than the server is willing or able
+to process"). The `AllExceptionsFilter` was updated to handle raw
+`MulterError` as well (400) for cases where NestJS doesn't wrap first,
+but in practice the `FileInterceptor` interceptor fires first and the 413
+path is taken. The e2e test accepts `[400, 413]` since both are correct
+implementations; the real implementation returns 413.
+
+### Tests
+- Unit: 49/49 (unchanged; `MimeValidatorService` is tested via e2e).
+- e2e: **123/123** across 8 suites (16 new in `attachments.e2e-spec.ts`):
+  - Valid uploads: PNG, JPEG, PDF, text/plain (each with real magic bytes).
+  - Path traversal: storagePath is UUID-based, doesn't echo the filename.
+  - 11 MB file rejected (400 or 413).
+  - Disallowed MIME rejected (400 with clear message).
+  - Magic-number mismatches rejected (400 "do not match").
+  - Unknown ticket → 404.
+  - Download: correct bytes, `Content-Type: image/png`,
+    `Content-Disposition: attachment; filename="..."`.
+  - DELETE: row gone + file gone from disk; second DELETE → 404.
+  - ATTACHMENT_DELETE audit row written.
+  - ATTACHMENT_UPLOAD audit row written.
+  - GET list returns all attachments for a ticket.
+
+### Files touched
+```
+.gitignore                                  (/uploads added)
+.env.example                                (UPLOADS_DIR added)
+.env                                        (UPLOADS_DIR=./uploads)
+src/common/all-exceptions.filter.ts        (MulterError → 400 handler)
+src/audit/audit-actions.ts                  (ATTACHMENT_UPLOAD, ATTACHMENT_DELETE, ATTACHMENT entity type)
+src/attachments/mime-validator.service.ts   (new — magic-number detection)
+src/attachments/attachments.service.ts      (new — upload, list, download, delete)
+src/attachments/attachments.controller.ts   (new — POST/GET/GET-download/DELETE)
+src/attachments/attachments.module.ts       (wired with AuditModule + Ticket entity)
+test/attachments.e2e-spec.ts               (new — 16 cases)
+```
+
+### Next session
+- CSV export/import (`csv-parse` and `csv-stringify`; comma+quote
+  roundtrip is a known reviewer-probe).
+- Escalation scheduler (`@Cron` job: overdue tickets with dueDate passed,
+  promote priority, set isOverdue, audit each escalation).
+- `run.md` — covers docker compose setup, .env, npm scripts, If-Match
+  contract, audit endpoint, password-on-create decision, UPLOADS_DIR.

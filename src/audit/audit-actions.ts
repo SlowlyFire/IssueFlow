@@ -25,6 +25,9 @@ export const AuditActions = {
   COMMENT_DELETE: 'COMMENT_DELETE',
 
   AUTO_ASSIGN: 'AUTO_ASSIGN',
+
+  ATTACHMENT_UPLOAD: 'ATTACHMENT_UPLOAD',
+  ATTACHMENT_DELETE: 'ATTACHMENT_DELETE',
 } as const;
 
 export type AuditAction = (typeof AuditActions)[keyof typeof AuditActions];
@@ -34,6 +37,7 @@ export const AuditEntityTypes = {
   PROJECT: 'Project',
   TICKET: 'Ticket',
   COMMENT: 'Comment',
+  ATTACHMENT: 'Attachment',
 } as const;
 
 export type AuditEntityType =
