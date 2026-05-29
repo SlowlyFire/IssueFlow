@@ -1200,3 +1200,134 @@ test/attachments.e2e-spec.ts               (new — 16 cases)
   promote priority, set isOverdue, audit each escalation).
 - `run.md` — covers docker compose setup, .env, npm scripts, If-Match
   contract, audit endpoint, password-on-create decision, UPLOADS_DIR.
+
+---
+
+## Session 9 — Escalation scheduler (2026-05-29)
+
+**Goal:** complete the escalation feature across five parts: pure function +
+tests (pre-existing from session skeleton), the EscalationService with the
+cycle logic, the cron handler, the manual-reset hook in tickets, the admin
+trigger endpoint, and the full e2e suite. CSV export/import remains.
+
+### Part A — Pure escalation function (pre-existing)
+
+`src/scheduler/escalation.ts` and `src/scheduler/escalation.spec.ts` were
+already written as untracked files. The 9 unit tests all pass on their own.
+The function signature is `escalateTicket(ticket, now): EscalationResult`.
+No code changes needed here; the tests cover all the CLAUDE.md rules including
+the boundary case (now === dueDate → treated as overdue).
+
+### Part B — EscalationService
+
+`src/scheduler/escalation.service.ts` — one method: `runEscalationCycle(now = new Date())`.
+
+**Candidate query** — one DB round-trip with four filters:
+- `deletedAt IS NULL` — TypeORM adds this automatically.
+- `dueDate IS NOT NULL` — no due date → escalation does not apply.
+- `status != DONE` — DONE tickets are frozen; their priority must not change.
+  Decision: filter at the DB load step (not let the conditional UPDATE silently
+  fail) for efficiency and clarity. Documented in the query comment.
+- `NOT (priority = CRITICAL AND isOverdue = true)` — terminal state. Expressed
+  in the query builder as `(priority != CRITICAL OR isOverdue = false)` via
+  De Morgan's law so TypeORM handles the property→column mapping.
+
+**Per-ticket update** — atomic `UPDATE tickets SET priority=…, isOverdue=…, version=version+1 WHERE id=? AND version=?` inside a `dataSource.transaction`. If the UPDATE affects 0 rows (concurrent user PATCH bumped the version), the audit INSERT is also skipped. Both operations are in the same transaction: if the priority UPDATE committed but the audit INSERT failed, we would have silent system-driven state changes with no record — unacceptable.
+
+**Return value** — `{ scanned, escalated, criticalMarked }`. `escalated` counts priority promotions (LOW/MEDIUM/HIGH → next), `criticalMarked` counts CRITICAL→isOverdue=true transitions.
+
+**isRunning guard** — a simple private boolean. If the cron fires while a
+previous cycle is executing (unlikely at 15-min interval, but possible under
+very large ticket volumes or a very short test interval), the incoming tick is
+dropped with a WARN log. The guard resets in the `finally` block so a crashed
+cycle doesn't permanently lock the scheduler.
+
+### Part C — Manual priority reset (tickets service, already present)
+
+`TicketsService.update` already clears `isOverdue = false` whenever `dto.priority`
+is supplied, regardless of the new priority value. Verified by the e2e case:
+"CRITICAL+isOverdue=true → PATCH priority to LOW → isOverdue=false → next cycle
+picks it up from LOW". This was implemented in Session 4's PATCH path. No change
+needed.
+
+### Part D — Cron handler
+
+`handleCron()` is a method in `EscalationService` decorated with `@Cron(...)`.
+It logs the cycle start, calls `runEscalationCycle()`, and logs the summary.
+No business logic in the handler itself.
+
+**`@Cron` and env vars** — `@Cron` arguments are evaluated at class-definition
+time (during module import), before ConfigModule.forRoot() loads the .env file.
+So `process.env['ESCALATION_CRON']` reads from the OS environment at startup,
+not from `.env`. The `.env.example` documents the variable with an explanatory
+comment. For the reviewer's default setup (no custom cron), the hardcoded
+fallback `*/15 * * * *` (every 15 minutes) applies.
+
+### Part E — POST /admin/escalate-now
+
+`src/scheduler/admin-escalation.controller.ts` — thin controller under
+`@Controller('admin')` with `@UseGuards(JwtAuthGuard, RolesGuard)` +
+`@Roles(UserRole.ADMIN)`. Guards are provided locally in `SchedulerModule`
+(same pattern as `AuditModule`) to avoid an import cycle through `AuthModule`.
+Returns `EscalationCycleSummary` directly. Documented in run.md as the
+reviewer's demo trigger.
+
+### DONE ticket decision
+
+DONE tickets are filtered at the DB load step (`status != DONE`). Rationale:
+DONE tickets are frozen by the business rule; escalating their priority violates
+the freeze. Filtering early is more efficient than letting the conditional UPDATE
+silently fail (the UPDATE would succeed because there's no DB trigger for the
+freeze — only the HTTP service layer enforces it). Documented in a query comment
+in `EscalationService` and in the e2e test description.
+
+### Tests
+- Unit: **58/58** (9 escalation pure cases + 49 prior, all green).
+- e2e: **140/140** across **9 suites** (17 new in `escalation.e2e-spec.ts`):
+  - LOW+overdue → MEDIUM, 1 audit row.
+  - MEDIUM+overdue → HIGH.
+  - HIGH+overdue → CRITICAL, isOverdue still false.
+  - CRITICAL+overdue+isOverdue=false → isOverdue=true, counted as criticalMarked.
+  - CRITICAL+overdue+isOverdue=true → no change (idempotent, filtered at load step).
+  - DONE+overdue → not escalated (filter decision exercised).
+  - Future dueDate → not escalated.
+  - Null dueDate → not escalated.
+  - Mixed 3-ticket cycle: exactly 2 audit rows (LOW→MEDIUM + CRITICAL→isOverdue).
+  - Idempotency: run cycle to terminal state, second run produces 0 changes/0 rows.
+  - Manual reset: CRITICAL+isOverdue=true → PATCH priority to LOW → isOverdue=false → next cycle escalates from LOW.
+  - Concurrent edit (version mismatch): conditional UPDATE with stale version → 0 rows affected → no audit row → happy-path cycle then succeeds.
+  - isRunning guard: second call with flag set returns zero summary immediately.
+  - POST /admin/escalate-now: 200 with `{ scanned, escalated, criticalMarked }` (ADMIN).
+  - POST /admin/escalate-now: 403 for DEVELOPER.
+  - POST /admin/escalate-now: 401 without token.
+  - Audit row shape: SYSTEM actor, actorId null, correct before/after priority.
+
+### Files touched
+```
+src/scheduler/escalation.ts                   (untracked → now tracked; no changes)
+src/scheduler/escalation.spec.ts              (untracked → now tracked; no changes)
+src/scheduler/escalation.service.ts           (new — cycle logic + cron handler)
+src/scheduler/admin-escalation.controller.ts  (new — POST /admin/escalate-now)
+src/scheduler/scheduler.module.ts             (wired: Ticket repo + guards + providers)
+.env.example                                  (ESCALATION_CRON documented)
+test/escalation.e2e-spec.ts                   (new — 17 cases)
+```
+
+### Curl demo (confirmed live)
+```
+POST /tickets  dueDate=2020-01-01, priority=LOW  →  { version: 1, priority: "LOW" }
+POST /admin/escalate-now                          →  { scanned: 1, escalated: 1, criticalMarked: 0 }
+GET  /tickets/:id                                 →  { version: 2, priority: "MEDIUM" }
+GET  /audit-logs?action=AUTO_ESCALATE             →  [{ actorType: "SYSTEM", actorId: null, beforePriority: "LOW", afterPriority: "MEDIUM" }]
+```
+
+### Next session (final)
+- CSV export/import: `GET /tickets/export?projectId=:id` and
+  `POST /tickets/import` with multipart `projectId` field.
+  Use `csv-stringify` / `csv-parse`. Fields: id, title, description, status,
+  priority, type, assigneeId. Handle commas and quotes correctly — the reviewer
+  will probe this specifically.
+- `run.md` — now critical to write before the submission deadline:
+  docker compose up, .env setup, npm scripts, the If-Match/ETag contract,
+  password-on-create decision, UPLOADS_DIR, and the escalation demo
+  (POST /admin/escalate-now).

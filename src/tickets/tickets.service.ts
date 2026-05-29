@@ -215,7 +215,15 @@ export class TicketsService {
     if (dto.title !== undefined) changes.title = dto.title;
     if (dto.description !== undefined) changes.description = dto.description;
     if (dto.status !== undefined) changes.status = dto.status;
-    if (dto.priority !== undefined) changes.priority = dto.priority;
+    if (dto.priority !== undefined) {
+      changes.priority = dto.priority;
+      // Manual priority change resets auto-escalation state (CLAUDE.md 3.7).
+      // The scheduler treats this ticket as fresh on the next cycle,
+      // regardless of whether it was escalated to CRITICAL or just flagged
+      // isOverdue. The clear happens unconditionally on any manual edit to
+      // the priority field — whether the user raises or lowers it.
+      changes.isOverdue = false;
+    }
     if (dto.assigneeId !== undefined) changes.assigneeId = dto.assigneeId;
     if (dto.dueDate !== undefined) changes.dueDate = dto.dueDate;
 
