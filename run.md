@@ -4,7 +4,16 @@
 
 - **Node.js 20 or higher** — `node --version` should print `v20.x.x` or later
 - **npm** — ships with Node.js 20; `npm --version` should print `10.x.x` or later
-- **Docker Desktop** — must be running before you start Postgres
+- **Docker Desktop** — must be installed AND running before you proceed.
+  Launch Docker from Spotlight or Applications. Wait for the whale icon
+  in the menu bar to stop animating (usually 10–30 seconds). Verify with:
+```bash
+  docker ps
+```
+  If you see a header row (with or without containers listed), Docker is up.
+  If you see "Cannot connect to the Docker daemon," wait and retry.
+
+
 
 No other tools are required.
 
@@ -12,30 +21,47 @@ No other tools are required.
 
 ## 2. Quick start
 
+Clone the repo and enter the directory:
 ```bash
 git clone https://github.com/SlowlyFire/IssueFlow.git
 cd IssueFlow
+```
+
+Copy the environment template:
+```bash
 cp .env.example .env
+```
+
+Start Postgres in the background:
+```bash
 docker compose up -d
+```
+
+Verify Postgres is up (you should see the db service as "running" or "healthy"):
+```bash
+docker compose ps
+```
+
+Install dependencies:
+```bash
 npm install
+```
+
+Start the app in watch mode:
+```bash
 npm run start:dev
 ```
 
-After the last command you should see output ending with:
+You should see `Nest application successfully started` in the logs. If you see this, the server is ready on `http://localhost:3000`.
 
-```
-[Nest] LOG [NestApplication] Nest application successfully started +Xms
-```
+**Keep this terminal open** — it shows the server logs and reloads on file changes. To run curl commands or other commands against the server, **open a second terminal** (`Cmd + T` for a new tab) and `cd` to the same project directory.
 
-The API is now listening on `http://localhost:3000`.
-
-If you do not see that line, scroll up for a red `ERROR` message — the most common causes are covered in the Troubleshooting section at the bottom of this file.
 
 ---
 
 ## 3. Environment variables
 
-All variables ship with development defaults in `.env.example`. Copy it to `.env` before starting — the app will refuse to boot if `JWT_SECRET` is missing.
+Copy `.env.example` to `.env` before starting. All variables ship with development defaults; the only one you'd ever change for a real deployment is `JWT_SECRET`.
 
 | Variable | Default | Purpose |
 |---|---|---|
@@ -44,11 +70,11 @@ All variables ship with development defaults in `.env.example`. Copy it to `.env
 | `DB_USERNAME` | `issueflow` | Postgres user |
 | `DB_PASSWORD` | `issueflow` | Postgres password |
 | `DB_NAME` | `issueflow` | Postgres database name |
-| `JWT_SECRET` | `change-me-in-prod` | Secret used to sign JWTs. **Must be changed for any real deployment.** The default is intentionally weak so it is obvious in config review. |
+| `JWT_SECRET` | `change-me-in-prod` | Secret used to sign JWTs. The default is intentionally weak so it's obvious in code review — change it for any real deployment. |
 | `JWT_EXPIRES_IN` | `3600` | Token lifetime in seconds (1 hour). |
 | `PORT` | `3000` | HTTP port the server listens on. |
 | `UPLOADS_DIR` | `./uploads` | Directory where uploaded attachments are stored on disk. Created automatically on first upload. |
-| `ESCALATION_CRON` | `*/15 * * * *` | Cron schedule for the priority-escalation job (standard 5-field format: minute/hour/dom/month/dow). Defaults to every 15 minutes when unset. **Note:** this variable is read from the OS environment at process startup, not from the `.env` file, because the `@Cron` decorator is evaluated before NestJS loads dotenv. To override it, export it in your shell before running `npm run start:dev`. |
+| `ESCALATION_CRON` | `*/15 * * * *` | Cron schedule for the priority-escalation job (standard 5-field format). See "Design decisions worth knowing" for the override gotcha. |
 
 ---
 
@@ -231,6 +257,7 @@ The `-v` flag removes the volume (all Postgres data). On the next `npm run start
 
 - **CSV import** validates each row independently. One invalid row does not abort the rest. The response body reports `{ created, failed, errors: [{row, error}] }` with 1-indexed row numbers.
 
+- **ESCALATION_CRON** is read from `process.env` at startup, before dotenv loads — to override it for local runs, export it in your shell rather than setting it in .`env.`
 ---
 
 ## 9. Troubleshooting
