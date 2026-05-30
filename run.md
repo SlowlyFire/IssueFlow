@@ -231,7 +231,7 @@ docker compose down -v
 docker compose up -d
 ```
 
-The `-v` flag removes the volume (all Postgres data). On the next `npm run start:dev`, TypeORM's `synchronize: true` recreates every table automatically from the entity definitions.
+The `-v` flag removes the volume (all Postgres data). **Then restart the NestJS server** (Ctrl+C in the server terminal, then `npm run start:dev` again) — TypeORM's `synchronize: true` only recreates tables on startup, so the running server needs to be bounced to see the empty database.
 
 ---
 
