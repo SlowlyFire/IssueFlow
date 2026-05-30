@@ -92,9 +92,9 @@ describe('Projects — soft-delete lifecycle (e2e)', () => {
       .set('Authorization', `Bearer ${adminToken}`)
       .send({ name: 'Alpha', description: 'Test', ownerId: adminId })
       .expect(200);
+    projectId = res.body.id; // assign before any assertion that could throw
     expect(res.body).toMatchObject({ name: 'Alpha', ownerId: adminId });
-    expect(res.body.deletedAt).toBeNull();
-    projectId = res.body.id;
+    expect(res.body).not.toHaveProperty('deletedAt');
   });
 
   it('rejects ownerId pointing to a non-existent user (404)', async () => {
@@ -133,8 +133,8 @@ describe('Projects — soft-delete lifecycle (e2e)', () => {
       .set('Authorization', `Bearer ${adminToken}`)
       .expect(200);
     const found = res.body.find((p: { id: number }) => p.id === projectId);
-    expect(found).toBeDefined();
-    expect(found.deletedAt).not.toBeNull();
+    expect(found).toBeDefined(); // presence in /deleted proves it is soft-deleted
+    expect(found).not.toHaveProperty('deletedAt'); // excluded from all responses
   });
 
   it('GET /projects/deleted returns 403 for a DEVELOPER', async () => {

@@ -1,3 +1,4 @@
+import { Exclude } from 'class-transformer';
 import {
   Column,
   CreateDateColumn,
@@ -57,6 +58,7 @@ export class Ticket {
   @UpdateDateColumn()
   updatedAt: Date;
 
+  @Exclude()
   @DeleteDateColumn()
   deletedAt: Date | null;
 }

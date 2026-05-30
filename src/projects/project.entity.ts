@@ -1,3 +1,4 @@
+import { Exclude } from 'class-transformer';
 import {
   Column,
   CreateDateColumn,
@@ -27,6 +28,7 @@ export class Project {
   @UpdateDateColumn()
   updatedAt: Date;
 
+  @Exclude()
   @DeleteDateColumn()
   deletedAt: Date | null;
 }
