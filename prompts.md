@@ -165,7 +165,9 @@ The options were: use `SchedulerRegistry` for dynamic registration (more correct
 ### "Tests pass" is necessary but not sufficient
 
 Post-Session 10, during the run.md verification curl tour, I noticed that the project response body still contained `"deletedAt": null` despite an `@Exclude()` fix the agent had reported as committed and tested. I confirmed the commit on GitHub and the green test suite. Both were true. The bug was elsewhere: the running NestJS server was launched from a different cloned directory — the dry-run clone I'd made earlier to verify run.md from a reviewer's perspective — and that directory had not been pulled. The fix existed; my server just wasn't running it.
+
 The lesson is not about the agent. It is about the verification surface. Tests prove the code in the test runner's working tree behaves correctly. They prove nothing about the code in any other process on the machine. End-to-end verification of the actual running endpoint — a curl against the live server, returning the live response body — is a separate check that catches a separate class of failure. After this I added the pattern of always re-running the curl tour from run.md after any change that touched a serialization boundary, regardless of test results.
+
 ---
 
 ## 5. Artifacts in this repo
