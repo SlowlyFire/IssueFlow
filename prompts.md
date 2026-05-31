@@ -8,11 +8,11 @@ I used Claude Code as the implementation agent throughout. My role was to scope 
 
 ## 1. Model & tools
 
-**Claude Opus 4.7** (via Claude.ai chat): used for architecture planning, working through hard design questions (concurrency model, audit snapshot strategy, mention-diff atomicity), and debugging sessions where I needed to think through root cause before writing a prompt. Opus produced longer, more careful reasoning chains on the tricky problems.
+**Claude Opus 4.7**: used in Claude Code for the highest-stakes implementation sessions — the state machine and TDD discipline (Session 1), tickets core with explicit optimistic locking (Session 4), and dependencies + auto-assignment with cycle detection (Session 5). Also used in Claude.ai chat for architecture planning and prompt engineering throughout.
 
-**Claude Sonnet 4.6** (via Claude Code CLI): used for all implementation sessions — CRUD scaffolding, entity plumbing, retrofitting existing services, writing tests, and generating documentation. Sonnet is faster and cheaper per token; for work where the design was already settled, it was the right tool.
+**Claude Sonnet 4.6**: used in Claude Code for the more routine sessions — audit retrofit (Session 6), attachments (Session 8), escalation scheduler (Session 9), CSV (Session 10), and the documentation passes. Faster and cheaper per token, and once the design was settled the marginal benefit of Opus dropped sharply.
 
-**Claude Code** as the agent shell, with the `CLAUDE.md` project-memory file keeping stable context across sessions. **Claude.ai chat** as a pair-programming surface for designing prompts before sending them to the implementation agent.
+The model for each session was chosen by task type, not subscription convenience. Switching mid-session was avoided because Claude Code's prompt cache is per-model — re-reading the conversation cache after a switch costs more than the speed difference saves on short sessions.
 
 ---
 
@@ -160,6 +160,12 @@ I asked the agent to explain exactly when the `@Cron` decorator argument is eval
 
 The options were: use `SchedulerRegistry` for dynamic registration (more correct, more code), or read directly from `process.env` (works when the variable is set in the OS environment before the process starts, documented limitation). I chose the second approach for this assignment and required that the limitation be clearly documented in both the code comment and `.env.example`. A reviewer who tries to set `ESCALATION_CRON` in `.env` and finds it ignored will find the explanation without digging into the source.
 
+
+
+### "Tests pass" is necessary but not sufficient
+
+Post-Session 10, during the run.md verification curl tour, I noticed that the project response body still contained `"deletedAt": null` despite an `@Exclude()` fix the agent had reported as committed and tested. I confirmed the commit on GitHub and the green test suite. Both were true. The bug was elsewhere: the running NestJS server was launched from a different cloned directory — the dry-run clone I'd made earlier to verify run.md from a reviewer's perspective — and that directory had not been pulled. The fix existed; my server just wasn't running it.
+The lesson is not about the agent. It is about the verification surface. Tests prove the code in the test runner's working tree behaves correctly. They prove nothing about the code in any other process on the machine. End-to-end verification of the actual running endpoint — a curl against the live server, returning the live response body — is a separate check that catches a separate class of failure. After this I added the pattern of always re-running the curl tour from run.md after any change that touched a serialization boundary, regardless of test results.
 ---
 
 ## 5. Artifacts in this repo
