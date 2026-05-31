@@ -5,6 +5,7 @@
 [circleci-image]: https://img.shields.io/circleci/build/github/nestjs/nest/master?token=abc123def456
 [circleci-url]: https://circleci.com/gh/nestjs/nest
 
+
   <p align="center">A progressive <a href="http://nodejs.org" target="_blank">Node.js</a> framework for building efficient and scalable server-side applications.</p>
     <p align="center">
 <a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/v/@nestjs/core.svg" alt="NPM Version" /></a>
@@ -23,6 +24,10 @@
   [![Sponsors on Open Collective](https://opencollective.com/nest/sponsors/badge.svg)](https://opencollective.com/nest#sponsor)-->
 
 # IssueFlow – Ticket Management Backend Platform
+
+**For setup, run, and test instructions, see [run.md](./run.md).**
+<br>
+**AI workflow is documented in [prompts.md](./prompts.md).**
 
 ## Overview
 IssueFlow is a backend service designed to handle a lightweight project and issue tracking platform.
